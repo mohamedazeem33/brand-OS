@@ -72,6 +72,7 @@ type LeadForm = Omit<Lead, 'id' | 'created_at' | 'updated_at' | 'received_at'>;
 type ClientForm = Omit<Client, 'id' | 'created_by' | 'created_at' | 'updated_at' | 'lead_id'>;
 
 const emptyForm: LeadForm = { name: '', phone: '', email: '', source: 'Other', service: '', assigned_to: null, status: 'new', follow_up_date: null, notes: '' };
+const emptyClientForm: ClientForm = { name: '', company_name: '', phone: '', email: '', source: 'Other', service: '', assigned_to: null, status: 'active', notes: '' };
 const statuses: Lead['status'][] = ['new', 'contacted', 'follow_up', 'converted', 'lost'];
 const clientStatuses: Client['status'][] = ['active', 'onboarding', 'paused', 'churned'];
 const clientStatusLabels: Record<Client['status'], string> = { active: 'Active', onboarding: 'Onboarding', paused: 'Paused', churned: 'Churned' };
@@ -247,6 +248,7 @@ function Workspace({ profile }: { profile: Profile }) {
   const [loading, setLoading] = useState(true);
   const [dataError, setDataError] = useState('');
   const [showAdd, setShowAdd] = useState(false);
+  const [showAddClient, setShowAddClient] = useState(false);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [showConverted, setShowConverted] = useState(false);
@@ -296,11 +298,25 @@ function Workspace({ profile }: { profile: Profile }) {
     setShowAdd(false);
   };
 
-  const saveClient = async (form: ClientForm, id: string) => {
-    const payload = { ...form, email: form.email || null, company_name: form.company_name || null };
-    const result = await supabase.from('clients').update(payload).eq('id', id).select().maybeSingle();
+  const saveClient = async (form: ClientForm, id?: string) => {
+    const payload = {
+      name: form.name.trim(),
+      company_name: form.company_name?.trim() || null,
+      phone: form.phone.trim(),
+      email: form.email?.trim() || null,
+      service: form.service?.trim() || 'Not specified',
+      source: form.source,
+      assigned_to: form.assigned_to || null,
+      status: form.status,
+      notes: form.notes || '',
+    };
+    const result = id
+      ? await supabase.from('clients').update(payload).eq('id', id).select().maybeSingle()
+      : await supabase.from('clients').insert({ ...payload, lead_id: null }).select().maybeSingle();
     if (result.error || !result.data) throw new Error(friendlyError());
-    await loadData(); setSelectedClient(result.data as Client);
+    await loadData();
+    setSelectedClient(result.data as Client);
+    setShowAddClient(false);
   };
 
   const signOut = async () => { await supabase.auth.signOut(); };
@@ -316,11 +332,12 @@ function Workspace({ profile }: { profile: Profile }) {
       <header className="topbar"><button className="menu-button" onClick={() => setMobileNav(true)}><Menu size={21} /></button><div className="breadcrumb"><span>Taha Media</span><i>/</i><strong>{navItems.find((item) => item.id === page)?.label}</strong></div><div className="topbar-actions"><span className="date-label"><CalendarDays size={16} /> {new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())}</span><button className="icon-button"><Bell size={18} /><i /></button><div className="top-avatar">{profile.full_name.slice(0, 1).toUpperCase()}</div></div></header>
       {page === 'dashboard' && <Dashboard leads={leads} profiles={profiles} clients={clients} onOpenLeads={() => setPage('leads')} onOpenClients={() => setPage('clients')} onAdd={() => setShowAdd(true)} onOpenConverted={() => setShowConverted(true)} onOpenClient={(c) => setSelectedClient(c)} />}
       {page === 'leads' && <LeadsPage leads={leads} profiles={profiles} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAdd(true)} onSelect={setSelectedLead} />}
-      {page === 'clients' && <ClientsPage clients={clients} profiles={profiles} loading={loading} error={dataError} onRetry={loadData} onSelect={setSelectedClient} />}
+      {page === 'clients' && <ClientsPage clients={clients} profiles={profiles} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAddClient(true)} onSelect={setSelectedClient} />}
       {page === 'team' && <TeamPage profile={profile} />}
       {['finance', 'settings'].includes(page) && <PlaceholderPage page={page} />}
     </main>
     {showAdd && <LeadModal profiles={profiles} onClose={() => setShowAdd(false)} onSave={(form) => saveLead(form)} />}
+    {showAddClient && <ClientModal profiles={profiles} onClose={() => setShowAddClient(false)} onSave={(form) => saveClient(form)} />}
     {selectedLead && <LeadDetail lead={selectedLead} profiles={profiles} onClose={() => setSelectedLead(null)} onSave={(form) => saveLead(form, selectedLead.id)} onConvert={(form, clientData) => convertLead(selectedLead.id, form, clientData)} />}
     {selectedClient && <ClientDetail client={selectedClient} profiles={profiles} onClose={() => setSelectedClient(null)} onSave={(form) => saveClient(form, selectedClient.id)} />}
     {showConverted && <ConvertedLeadsView leads={leads.filter((l) => l.status === 'converted')} clients={clients} profiles={profiles} onClose={() => setShowConverted(false)} onOpenClient={(c) => { setShowConverted(false); setSelectedClient(c); }} />}
@@ -387,7 +404,7 @@ function LeadEditor({ title, profiles, initial, onClose, onSave, onConvert, deta
   </section></div>;
 }
 
-function ClientsPage({ clients, profiles, loading, error, onRetry, onSelect }: { clients: Client[]; profiles: Profile[]; loading: boolean; error: string; onRetry: () => void; onSelect: (client: Client) => void }) {
+function ClientsPage({ clients, profiles, loading, error, onRetry, onAdd, onSelect }: { clients: Client[]; profiles: Profile[]; loading: boolean; error: string; onRetry: () => void; onAdd: () => void; onSelect: (client: Client) => void }) {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('All status');
   const [sourceFilter, setSourceFilter] = useState('All sources');
@@ -396,13 +413,48 @@ function ClientsPage({ clients, profiles, loading, error, onRetry, onSelect }: {
     (statusFilter === 'All status' || c.status === statusFilter) &&
     (sourceFilter === 'All sources' || c.source === sourceFilter)),
     [clients, query, statusFilter, sourceFilter]);
-  return <div className="page-content"><div className="page-title-row leads-title"><div><p className="eyebrow">Roster / {clients.length.toString().padStart(2, '0')} clients</p><h1>Client management</h1><p className="subtitle">Every relationship, nurtured and accounted for.</p></div></div>
+  return <div className="page-content"><div className="page-title-row leads-title"><div><p className="eyebrow">Roster / {clients.length.toString().padStart(2, '0')} clients</p><h1>Client management</h1><p className="subtitle">Every relationship, nurtured and accounted for.</p></div><button className="lime-button" onClick={onAdd}><CirclePlus size={18} /> Add Client</button></div>
     <div className="filter-bar"><div className="search-box"><Search size={18} /><input placeholder="Search clients" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="filter-select"><Filter size={16} /><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>{clientStatusOptions.map((s) => <option key={s} value={s}>{s === 'All status' ? 'All status' : clientStatusLabels[s as Client['status']]}</option>)}</select></div><div className="filter-select"><select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>{sources.map((s) => <option key={s}>{s}</option>)}</select></div></div>
     {error ? <div className="data-state"><CircleAlert size={22} /><h3>We couldn't load your clients</h3><p>Check your connection and try again.</p><button className="outline-button" onClick={onRetry}>Try again</button></div>
      : loading ? <div className="data-state"><div className="spinner" /><p>Loading your clients…</p></div>
-     : filtered.length === 0 ? <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>{clients.length === 0 ? 'No clients yet' : 'No clients found'}</h3><p>{clients.length === 0 ? 'Convert a lead to create your first client.' : 'Adjust your search or filters.'}</p></div>
+     : filtered.length === 0 ? <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>{clients.length === 0 ? 'No clients yet' : 'No clients found'}</h3><p>{clients.length === 0 ? 'Convert a lead or add your first client.' : 'Adjust your search or filters.'}</p>{clients.length === 0 && <button className="lime-button" onClick={onAdd}><CirclePlus size={17} /> Add Client</button>}</div>
      : <div className="client-grid">{filtered.map((c) => <div className="client-card" key={c.id} onClick={() => onSelect(c)}><div className="client-card-top"><div className="client-avatar">{c.name.slice(0, 1).toUpperCase()}</div><span className={`client-status-pill ${c.status}`}>{clientStatusLabel(c.status)}</span></div><h3>{c.name}</h3>{c.company_name && <p className="client-company"><Building2 size={14} /> {c.company_name}</p>}<div className="client-card-meta"><span className="source-tag"><i />{c.service}</span></div><div className="client-card-meta-secondary"><span>{profiles.find((p) => p.id === c.assigned_to)?.full_name || <span className="muted">Unassigned</span>}</span><span className="muted">{formatReceived(c.created_at)}</span></div><div className="client-card-footer"><span className="source-tag"><i />{c.source}</span><button className="text-button">View client <ArrowUpRight size={14} /></button></div></div>)}</div>}
   </div>;
+}
+
+function ClientModal({ profiles, onClose, onSave }: { profiles: Profile[]; onClose: () => void; onSave: (form: ClientForm) => Promise<void> }) {
+  const [form, setForm] = useState<ClientForm>(emptyClientForm);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const update = <K extends keyof ClientForm>(key: K, value: ClientForm[K]) => setForm((current) => ({ ...current, [key]: value }));
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSaving(true);
+    setError('');
+    try {
+      await onSave(form);
+    } catch {
+      setError(friendlyError());
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className="lead-drawer"><div className="drawer-header"><div><p className="eyebrow">New relationship</p><h2>Add a client</h2></div><button className="close-button" onClick={onClose}><X size={20} /></button></div>
+    <form className="lead-form" onSubmit={submit}><div className="form-grid">
+      <label>Full name<input value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="e.g. Ahmed Khan" required /></label>
+      <label>Company / business<input value={form.company_name ?? ''} onChange={(e) => update('company_name', e.target.value)} placeholder="Optional" /></label>
+      <label>Phone number<input value={form.phone} onChange={(e) => update('phone', e.target.value)} placeholder="+92 300 0000000" required /></label>
+      <label>Email address<input type="email" value={form.email ?? ''} onChange={(e) => update('email', e.target.value)} placeholder="Optional" /></label>
+      <label>Service<input value={form.service} onChange={(e) => update('service', e.target.value)} placeholder="e.g. Social media management" /></label>
+      <label>Lead source<select value={form.source} onChange={(e) => update('source', e.target.value as Client['source'])}>{sources.slice(1).map((s) => <option key={s}>{s}</option>)}</select></label>
+      <label>Assigned salesperson<select value={form.assigned_to ?? ''} onChange={(e) => update('assigned_to', e.target.value || null)}><option value="">Unassigned</option>{profiles.map((p) => <option value={p.id} key={p.id}>{p.full_name}</option>)}</select></label>
+      <label>Client status<select value={form.status} onChange={(e) => update('status', e.target.value as Client['status'])}>{clientStatuses.map((s) => <option key={s} value={s}>{clientStatusLabel(s)}</option>)}</select></label>
+    </div>
+    <label className="notes-field">Internal notes<textarea rows={5} value={form.notes} onChange={(e) => update('notes', e.target.value)} placeholder="Add useful context…" /></label>
+    {error && <div className="auth-message"><CircleAlert size={16} />{error}</div>}
+    <div className="drawer-footer"><button type="button" className="outline-button" onClick={onClose}>Cancel</button><button className="lime-button" disabled={saving}>{saving ? 'Saving…' : <>Create client <ArrowUpRight size={17} /></>}</button></div>
+    </form>
+  </section></div>;
 }
 
 function ClientDetail({ client, profiles, onClose, onSave }: { client: Client; profiles: Profile[]; onClose: () => void; onSave: (form: ClientForm) => Promise<void> }) {
@@ -528,7 +580,7 @@ function TeamPage({ profile }: { profile: Profile }) {
       </tr>)}
     </tbody></table></div>}
     {showAdd && isAdmin && <AddEmployeeModal onClose={() => setShowAdd(false)} onCreated={async () => { setShowAdd(false); await loadEmployees(); }} />}
-    {actionRow && isAdmin && <EmployeeActionDrawer profile={actionRow} onClose={() => setActionRow(null)} onConfirm={(action, value) => { setActionRow(null); setConfirmState({ profile: actionRow, action, newRole: action === 'set_role' ? value : undefined, newActive: action === 'toggle_active' ? Boolean(value) : undefined }); }} />}
+    {actionRow && isAdmin && <EmployeeActionDrawer profile={actionRow} onClose={() => setActionRow(null)} onConfirm={(action, value) => { setActionRow(null); setConfirmState({ profile: actionRow, action, newRole: action === 'set_role' ? (value as string) : undefined, newActive: action === 'toggle_active' ? Boolean(value) : undefined }); }} />}
     {confirmState && <ConfirmDialog state={confirmState} working={working} onCancel={() => setConfirmState(null)} onConfirm={runAction} />}
   </div>;
 }
