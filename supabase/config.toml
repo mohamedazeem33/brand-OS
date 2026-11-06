@@ -1,2 +1,5 @@
 [functions.team-admin]
 verify_jwt = true
+
+[functions.meta-lead-webhook]
+verify_jwt = false

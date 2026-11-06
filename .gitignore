@@ -21,3 +21,14 @@ dist-ssr
 *.sln
 *.sw?
 .env
+*.env.*
+
+# Secrets & Credential files
+supabase and make.com key.txt
+*key*.txt
+*secret*.txt
+credentials*.txt
+*.pem
+*.key
+
+supabase/.temp/
