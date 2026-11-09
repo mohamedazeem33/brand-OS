@@ -33,7 +33,6 @@ import {
   PhoneIncoming,
   PhoneMissed,
   Plus,
-  RefreshCw,
   RotateCcw,
   Search,
   Settings,
@@ -2603,6 +2602,9 @@ type MetaLeadForm = {
   id: string;
   name: string;
   status?: string;
+  connection_status?: 'saved' | 'connected' | 'receiving_leads';
+  page_id?: string;
+  source_url?: string;
   created_at?: string;
 };
 
@@ -2625,23 +2627,6 @@ type AgencySettings = {
 };
 
 type SettingsSection = 'profile' | 'integrations';
-
-function formatSettingsTimestamp(isoStr: string | null): string {
-  if (!isoStr) return '—';
-  try {
-    const date = new Date(isoStr);
-    return new Intl.DateTimeFormat('en-IN', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    }).format(date);
-  } catch {
-    return isoStr;
-  }
-}
 
 function SettingsPage({
   profile,
@@ -2675,18 +2660,8 @@ function SettingsPage({
   const [removeLogo, setRemoveLogo] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Meta Lead Forms state
-  const [leadForms, setLeadForms] = useState<MetaLeadForm[]>([]);
-  const [showAddFormModal, setShowAddFormModal] = useState(false);
-  const [newFormName, setNewFormName] = useState('');
-  const [newFormId, setNewFormId] = useState('');
-  const [formModalError, setFormModalError] = useState('');
-  const [savingForms, setSavingForms] = useState(false);
-
-  // Live webhook / Meta Ads lead metrics
-  const [metaLeadsCount, setMetaLeadsCount] = useState<number>(0);
-  const [lastMetaLeadAt, setLastMetaLeadAt] = useState<string | null>(null);
-  const [loadingMetrics, setLoadingMetrics] = useState(true);
+  // Meta Instant Form placeholder state
+  const [instantFormLink, setInstantFormLink] = useState('');
 
   // General state
   const [loading, setLoading] = useState(true);
@@ -2719,8 +2694,6 @@ function SettingsPage({
           address: data.address || '',
         });
         setLogoUrl(data.logo_url || null);
-        const forms = Array.isArray(data.meta_lead_forms) ? data.meta_lead_forms : [];
-        setLeadForms(forms);
       }
     } catch (err: any) {
       console.error('Error loading agency settings:', err);
@@ -2730,35 +2703,8 @@ function SettingsPage({
     }
   };
 
-  // Load Meta webhook live lead metrics
-  const loadWebhookMetrics = async () => {
-    setLoadingMetrics(true);
-    try {
-      const { count, error: countErr } = await supabase
-        .from('leads')
-        .select('*', { count: 'exact', head: true })
-        .eq('source', 'Meta Ads');
-
-      const { data: latestLead, error: leadErr } = await supabase
-        .from('leads')
-        .select('created_at')
-        .eq('source', 'Meta Ads')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (!countErr) setMetaLeadsCount(count ?? 0);
-      if (!leadErr && latestLead) setLastMetaLeadAt(latestLead.created_at);
-    } catch (err) {
-      console.warn('Webhook metrics fetch failed:', err);
-    } finally {
-      setLoadingMetrics(false);
-    }
-  };
-
   useEffect(() => {
     loadSettings();
-    loadWebhookMetrics();
   }, []);
 
   // Dirty detection for Agency Profile
@@ -2939,81 +2885,7 @@ function SettingsPage({
     setShowCancelModal(false);
   };
 
-  // Add / Remove Approved Lead Form
-  const handleAddLeadForm = async () => {
-    if (!newFormName.trim() || !newFormId.trim()) {
-      setFormModalError('Please enter both Form Name and Form ID.');
-      return;
-    }
-    const cleanId = newFormId.trim();
-    if (leadForms.some((f) => f.id === cleanId)) {
-      setFormModalError('A form with this ID is already approved.');
-      return;
-    }
 
-    const updated = [
-      ...leadForms,
-      {
-        id: cleanId,
-        name: newFormName.trim(),
-        status: 'active',
-        created_at: new Date().toISOString(),
-      },
-    ];
-
-    setSavingForms(true);
-    setFormModalError('');
-    try {
-      const { error: dbErr } = await supabase
-        .from('agency_settings')
-        .update({
-          meta_lead_forms: updated,
-          updated_at: new Date().toISOString(),
-          updated_by: profile.id,
-        })
-        .eq('id', settings?.id || 'default');
-
-      if (dbErr) throw dbErr;
-
-      setLeadForms(updated);
-      if (settings) {
-        setSettings({ ...settings, meta_lead_forms: updated });
-      }
-      setShowAddFormModal(false);
-      setNewFormName('');
-      setNewFormId('');
-    } catch (err: any) {
-      setFormModalError(err?.message || 'Failed to save lead form.');
-    } finally {
-      setSavingForms(false);
-    }
-  };
-
-  const handleRemoveLeadForm = async (formId: string) => {
-    const updated = leadForms.filter((f) => f.id !== formId);
-    setSavingForms(true);
-    try {
-      const { error: dbErr } = await supabase
-        .from('agency_settings')
-        .update({
-          meta_lead_forms: updated,
-          updated_at: new Date().toISOString(),
-          updated_by: profile.id,
-        })
-        .eq('id', settings?.id || 'default');
-
-      if (dbErr) throw dbErr;
-
-      setLeadForms(updated);
-      if (settings) {
-        setSettings({ ...settings, meta_lead_forms: updated });
-      }
-    } catch (err) {
-      console.error('Failed to remove lead form:', err);
-    } finally {
-      setSavingForms(false);
-    }
-  };
 
   // Fallback to default /taha_logo.png if no custom logo is uploaded
   const displayLogoSrc = stagedLogoPreview || (!removeLogo && logoUrl ? logoUrl : '/taha_logo.png');
@@ -3030,10 +2902,10 @@ function SettingsPage({
       </div>
 
       {/* Two-section Navigation Tab Strip */}
-      <div className="settings-nav-strip">
+      <div className="settings-tabs">
         <button
           type="button"
-          className={`settings-nav-tab ${activeSection === 'profile' ? 'active' : ''}`}
+          className={`settings-tab ${activeSection === 'profile' ? 'active' : ''}`}
           onClick={() => {
             if (activeSection !== 'profile') {
               if (isProfileDirty) {
@@ -3044,13 +2916,13 @@ function SettingsPage({
             }
           }}
         >
-          <Building2 size={15} />
+          <Building2 size={16} />
           <span>Agency Profile</span>
         </button>
 
         <button
           type="button"
-          className={`settings-nav-tab ${activeSection === 'integrations' ? 'active' : ''}`}
+          className={`settings-tab ${activeSection === 'integrations' ? 'active' : ''}`}
           onClick={() => {
             if (activeSection !== 'integrations') {
               if (isProfileDirty) {
@@ -3061,7 +2933,7 @@ function SettingsPage({
             }
           }}
         >
-          <SlidersHorizontal size={15} />
+          <SlidersHorizontal size={16} />
           <span>Integrations</span>
         </button>
       </div>
@@ -3284,231 +3156,39 @@ function SettingsPage({
           {activeSection === 'integrations' && (
             <div>
               <div className="settings-section-header">
-                <h2>External Integrations</h2>
-                <p>Status of advertising pipelines and webhook automation channels.</p>
+                <h2>Meta Instant Form</h2>
+                <p>Add an Instant Form link for future lead integration.</p>
               </div>
 
-              <div className="control-grid" style={{ marginBottom: 24 }}>
-                {/* Meta Ads Integration Card */}
-                <div className="control-card">
-                  <div>
-                    <div className="control-card-header">
-                      <div className="control-card-title">
-                        <SlidersHorizontal size={16} />
-                        <span>Meta Ads</span>
-                      </div>
-                      <span className="system-status-pill verified">Relayed via Make.com</span>
-                    </div>
-                    <p className="control-card-desc">
-                      Lead generation campaigns capture prospects from Facebook and Instagram Instant Forms.
-                    </p>
-                    <ul className="control-card-items">
-                      <li>
-                        <i />
-                        Connected Facebook Page: <strong>Taha Media</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Page ID: <strong>104523992487431</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Relay Strategy: <strong>Make.com Webhook Scenario</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Active Lead Source: <strong>Meta Ads</strong>
-                      </li>
-                    </ul>
-                  </div>
-                  <div className="control-card-meta">
-                    <span>Approved Instant Forms</span>
-                    <strong>{leadForms.length} Active</strong>
-                  </div>
-                </div>
-
-                {/* Make.com Relay Card */}
-                <div className="control-card">
-                  <div>
-                    <div className="control-card-header">
-                      <div className="control-card-title">
-                        <RefreshCw size={16} />
-                        <span>Make.com</span>
-                      </div>
-                      <span className="system-status-pill verified">Active Webhook Relay</span>
-                    </div>
-                    <p className="control-card-desc">
-                      Make.com scenario validates webhook authenticity and relays incoming leads to Supabase Edge Functions.
-                    </p>
-                    <ul className="control-card-items">
-                      <li>
-                        <i />
-                        Relay Status: <strong>Operational</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Secret Validation: <strong>Fail-Closed (HMAC)</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Payload Mapping: <strong>Name, Email, Phone, Form, Campaign</strong>
-                      </li>
-                      <li>
-                        <i />
-                        Total Relayed Leads: <strong>{loadingMetrics ? '…' : `${metaLeadsCount} leads recorded`}</strong>
-                      </li>
-                    </ul>
-                  </div>
-                  <div className="control-card-meta">
-                    <span>Latest Relayed Lead</span>
-                    <strong>{loadingMetrics ? '…' : formatSettingsTimestamp(lastMetaLeadAt)}</strong>
-                  </div>
-                </div>
-              </div>
-
-              {/* Approved Instant Forms Management */}
-              <div className="lead-forms-section">
-                <div className="lead-forms-header">
-                  <div>
-                    <h3>Approved Instant Forms</h3>
-                    <p>Manage Meta Ads lead generation forms authorized to feed into the CRM.</p>
+              <div className="meta-link-input-card">
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!instantFormLink.trim()) return;
+                    setInstantFormLink('');
+                  }}
+                  className="meta-link-input-row"
+                >
+                  <div className="meta-link-input-fields">
+                    <input
+                      type="text"
+                      placeholder="Paste Meta Instant Form link"
+                      value={instantFormLink}
+                      onChange={(e) => setInstantFormLink(e.target.value)}
+                    />
                   </div>
                   <button
-                    type="button"
-                    className="outline-button"
-                    onClick={() => {
-                      setNewFormName('');
-                      setNewFormId('');
-                      setFormModalError('');
-                      setShowAddFormModal(true);
-                    }}
+                    type="submit"
+                    className="lime-button"
+                    style={{ minHeight: 40, whiteSpace: 'nowrap' }}
                   >
-                    <Plus size={14} />
-                    <span>Add Approved Form</span>
+                    <Plus size={15} />
+                    <span>Add Form</span>
                   </button>
-                </div>
-
-                {leadForms.length === 0 ? (
-                  <div className="empty-state" style={{ padding: '24px 0' }}>
-                    <p>No lead forms currently approved. Click "Add Approved Form" to configure one.</p>
-                  </div>
-                ) : (
-                  <div className="lead-forms-list">
-                    {leadForms.map((formItem) => (
-                      <div key={formItem.id} className="meta-form-row">
-                        <div className="meta-form-info">
-                          <div className="meta-form-icon">
-                            <FileText size={16} />
-                          </div>
-                          <div className="meta-form-text">
-                            <div className="meta-form-name">{formItem.name}</div>
-                            <div className="meta-form-id">Form ID: {formItem.id}</div>
-                          </div>
-                        </div>
-
-                        <div className="meta-form-actions">
-                          <span className="system-status-pill verified">Active</span>
-                          <button
-                            type="button"
-                            className="icon-button"
-                            title="Remove form"
-                            disabled={savingForms}
-                            onClick={() => handleRemoveLeadForm(formItem.id)}
-                          >
-                            <Trash2 size={15} style={{ color: '#99544a' }} />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Direct Meta Connection Architecture Notice */}
-                <div className="meta-future-banner">
-                  <div className="meta-future-banner-icon">
-                    <Sparkles size={20} />
-                  </div>
-                  <div className="meta-future-banner-content">
-                    <h4>Direct Meta Graph API Expansion Architecture</h4>
-                    <p>
-                      This module is designed to accommodate direct Meta OAuth and Graph API webhook integration (with App Review for leads_retrieval).
-                      The current Make.com relay operates reliably in parallel and will continue forwarding leads without interruption.
-                    </p>
-                  </div>
-                </div>
+                </form>
               </div>
             </div>
           )}
-        </div>
-      )}
-
-      {/* Add Approved Form Modal */}
-      {showAddFormModal && (
-        <div
-          className="modal-backdrop"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) setShowAddFormModal(false);
-          }}
-        >
-          <section className="confirm-dialog meta-add-form-modal">
-            <div className="confirm-icon" style={{ background: '#eff9d6', color: '#4e631d' }}>
-              <Plus size={22} />
-            </div>
-            <h3>Add Approved Instant Form</h3>
-            <p className="confirm-subtitle">
-              Authorize a Meta Instant Form to feed leads into Taha Media.
-            </p>
-
-            {formModalError && (
-              <div className="settings-alert error" style={{ margin: '12px 0', padding: '10px 14px' }}>
-                <AlertTriangle size={15} />
-                <span>{formModalError}</span>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14, textAlign: 'left', margin: '16px 0 20px' }}>
-              <div className="form-group">
-                <label htmlFor="modal_form_name">Form Name</label>
-                <input
-                  id="modal_form_name"
-                  type="text"
-                  placeholder="e.g. Taha Media - Client Enquiry Form"
-                  value={newFormName}
-                  onChange={(e) => setNewFormName(e.target.value)}
-                />
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="modal_form_id">Meta Form ID</label>
-                <input
-                  id="modal_form_id"
-                  type="text"
-                  placeholder="e.g. 1650833669757581"
-                  value={newFormId}
-                  onChange={(e) => setNewFormId(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div className="drawer-footer" style={{ justifyContent: 'center' }}>
-              <button
-                type="button"
-                className="outline-button"
-                disabled={savingForms}
-                onClick={() => setShowAddFormModal(false)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="lime-button"
-                disabled={savingForms}
-                onClick={handleAddLeadForm}
-              >
-                {savingForms ? 'Saving…' : 'Add Form'}
-              </button>
-            </div>
-          </section>
         </div>
       )}
 

@@ -56,6 +56,61 @@ function randomPassword(length = 16) {
   return out;
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
+
+/**
+ * Checks for email collision across all auth users via pagination,
+ * as well as pending email changes and public.profiles records.
+ * Returns an error object on failure to ensure fail-closed security.
+ */
+async function isEmailTaken(
+  supabase: ReturnType<typeof adminClient>,
+  emailToCheck: string,
+  excludeUserId?: string
+): Promise<{ taken: boolean; error?: string }> {
+  const targetEmail = emailToCheck.trim().toLowerCase();
+  let page = 1;
+  const perPage = 50;
+
+  while (true) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+    if (error) {
+      console.error("isEmailTaken: listUsers failed on page", page, error.message);
+      return { taken: false, error: `Failed to verify email availability: ${error.message}` };
+    }
+
+    if (!data?.users || data.users.length === 0) break;
+
+    for (const u of data.users) {
+      if (!excludeUserId || u.id !== excludeUserId) {
+        if (u.email?.toLowerCase() === targetEmail) return { taken: true };
+        // Check if an unconfirmed email change is already targeting this email
+        const newEmailPending = (u as { new_email?: string }).new_email;
+        if (newEmailPending && newEmailPending.toLowerCase() === targetEmail) return { taken: true };
+      }
+    }
+
+    if (data.users.length < perPage) break;
+    page++;
+  }
+
+  // Secondary check against public.profiles
+  let profileQuery = supabase.from("profiles").select("id").ilike("email", targetEmail);
+  if (excludeUserId) {
+    profileQuery = profileQuery.neq("id", excludeUserId);
+  }
+  const { data: profileMatch, error: profileErr } = await profileQuery.maybeSingle();
+  if (profileErr) {
+    console.error("isEmailTaken: profile lookup failed:", profileErr.message);
+    return { taken: false, error: `Failed to check existing profile records: ${profileErr.message}` };
+  }
+  if (profileMatch) return { taken: true };
+
+  return { taken: false };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
@@ -77,10 +132,10 @@ Deno.serve(async (req: Request) => {
       if (!email || !fullName) return errorResponse("Name and email are required.", 400);
       if (!ALLOWED_ROLES.includes(role)) return errorResponse("Invalid role.", 400);
 
-      // Check for existing user with this email
-      const { data: existing } = await supabase.auth.admin.listUsers();
-      const taken = (existing?.users ?? []).some((u) => u.email?.toLowerCase() === email);
-      if (taken) return errorResponse("An account with this email already exists.", 409);
+      // Check for existing user with this email across all paginated users (fail-closed)
+      const emailCheck = await isEmailTaken(supabase, email);
+      if (emailCheck.error) return errorResponse(emailCheck.error, 500);
+      if (emailCheck.taken) return errorResponse("An account with this email already exists.", 409);
 
       // Primary: invite flow — user sets their own password via email link.
       let inviteMethod: "invite" | "temp_password" = "invite";
@@ -123,17 +178,19 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // PATCH — update role or toggle active status
+    // PATCH — update role, toggle active status, or update credentials
     if (req.method === "PATCH") {
       const body = await req.json();
-      const userId = typeof body.user_id === "string" ? body.user_id : "";
+      const userId = typeof body.user_id === "string" ? body.user_id.trim() : "";
 
-      if (!userId) return errorResponse("Employee ID is required.", 400);
+      if (!userId || !UUID_REGEX.test(userId)) {
+        return errorResponse("A valid employee UUID is required.", 400);
+      }
 
-      // Fetch the target profile
+      // Fetch the target profile to ensure account exists
       const { data: target, error: fetchErr } = await supabase
         .from("profiles")
-        .select("id, role, is_active")
+        .select("id, email, role, is_active")
         .eq("id", userId)
         .maybeSingle();
       if (fetchErr || !target) return errorResponse("Employee not found.", 404);
@@ -170,6 +227,103 @@ Deno.serve(async (req: Request) => {
         const { error } = await supabase.from("profiles").update({ is_active: nextActive }).eq("id", userId);
         if (error) return errorResponse("Could not update the account status.", 500);
         return json({ success: true });
+      }
+
+      // Update credentials (email and/or password)
+      if (body.action === "update_credentials") {
+        const rawEmail = typeof body.new_email === "string" ? body.new_email : (typeof body.email === "string" ? body.email : "");
+        const rawPassword = typeof body.new_password === "string" ? body.new_password : (typeof body.password === "string" ? body.password : "");
+
+        const newEmail = rawEmail.trim().toLowerCase();
+        const newPassword = rawPassword;
+
+        if (!newEmail && !newPassword) {
+          return errorResponse("Either a new email or new password must be provided.", 400);
+        }
+
+        const updates: { email?: string; password?: string } = {};
+
+        if (newEmail) {
+          if (!EMAIL_REGEX.test(newEmail)) {
+            return errorResponse("Invalid email format.", 400);
+          }
+
+          // Check if new email is already taken across all paginated users (fail-closed)
+          const emailCheck = await isEmailTaken(supabase, newEmail, userId);
+          if (emailCheck.error) {
+            return errorResponse(emailCheck.error, 500);
+          }
+          if (emailCheck.taken) {
+            return errorResponse("An account with this email already exists.", 409);
+          }
+          updates.email = newEmail;
+        }
+
+        if (newPassword) {
+          if (newPassword.length < MIN_PASSWORD_LENGTH) {
+            return errorResponse(`Password must be at least ${MIN_PASSWORD_LENGTH} characters long.`, 400);
+          }
+          updates.password = newPassword;
+        }
+
+        // Support explicit administrative email confirmation without email dispatch
+        if (body.email_confirm === true) {
+          updates.email_confirm = true;
+        }
+
+        // Update existing Supabase Auth user by UUID (never delete or recreate)
+        const { data: updateRes, error: updateError } = await supabase.auth.admin.updateUserById(
+          userId,
+          updates
+        );
+
+        if (updateError) {
+          console.error("Auth admin updateUserById failed for user:", userId, updateError.message);
+          if (updateError.message?.toLowerCase().includes("already registered") || updateError.status === 422) {
+            return errorResponse("An account with this email already exists.", 409);
+          }
+          return errorResponse(updateError.message || "Failed to update user credentials.", 400);
+        }
+
+        const updatedUser = updateRes?.user;
+        const isEmailConfirmed = updatedUser?.email?.toLowerCase() === newEmail;
+
+        // Requirement: Do not update public.profiles.email until Auth email change is fully confirmed.
+        // Profile must stay consistent with the actual confirmed Auth email.
+        if (newEmail && isEmailConfirmed) {
+          const { error: profileSyncError } = await supabase
+            .from("profiles")
+            .update({ email: newEmail })
+            .eq("id", userId);
+
+          if (profileSyncError) {
+            console.error("Profile email synchronization failed for user:", userId, profileSyncError.message);
+            return errorResponse("Authentication updated, but profile email synchronization failed.", 500);
+          }
+        }
+
+        // Distinct, accurate success messages for each scenario
+        let message = "User credentials updated successfully.";
+        if (newEmail && newPassword) {
+          message = isEmailConfirmed
+            ? "Email and password updated successfully."
+            : `Password updated successfully. Email change confirmation sent to ${newEmail}.`;
+        } else if (newEmail) {
+          message = isEmailConfirmed
+            ? "Email updated successfully."
+            : `Email change confirmation sent to ${newEmail}.`;
+        } else if (newPassword) {
+          message = "Password updated successfully.";
+        }
+
+        return json({
+          success: true,
+          message,
+          user_id: userId,
+          email_updated: isEmailConfirmed,
+          email_change_pending: !isEmailConfirmed && !!newEmail,
+          password_updated: !!newPassword,
+        });
       }
 
       return errorResponse("Unknown action.", 400);
