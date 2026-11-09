@@ -199,28 +199,6 @@ Deno.serve(async (req: Request) => {
       receivedAt = new Date().toISOString();
     }
 
-    // Compile Notes with any Meta form metadata
-    const notesParts: string[] = [];
-    if (body.notes && typeof body.notes === "string" && body.notes.trim()) {
-      notesParts.push(body.notes.trim());
-    }
-
-    const metaContext: string[] = [];
-    if (body.form_name) metaContext.push(`Form: ${body.form_name}`);
-    if (body.form_id) metaContext.push(`Form ID: ${body.form_id}`);
-    if (body.campaign_name) metaContext.push(`Campaign: ${body.campaign_name}`);
-    if (body.ad_name) metaContext.push(`Ad: ${body.ad_name}`);
-    if (fromFieldData.unmapped.length > 0) {
-      metaContext.push(...fromFieldData.unmapped);
-    }
-
-    if (metaContext.length > 0) {
-      if (notesParts.length > 0) notesParts.push("");
-      notesParts.push("--- Meta Form Data ---");
-      notesParts.push(...metaContext);
-    }
-    const compiledNotes = notesParts.join("\n");
-
     const supabase = adminClient();
 
     // 4. Duplicate Check by meta_lead_id
@@ -242,6 +220,79 @@ Deno.serve(async (req: Request) => {
         }, 200);
       }
     }
+
+    // 5. Approved Forms Validation & Routing
+    // Protects the client pipeline by discarding unapproved forms (e.g. hiring/unrelated campaigns)
+    // or deactivated forms.
+    const incomingFormId = (body.form_id ?? body.formId ?? body.leadgen_id ?? "").toString().trim() || null;
+    let matchedForm: { id: string; name: string; status?: string; page_id?: string } | null = null;
+
+    if (incomingFormId) {
+      const { data: settingsRow, error: settingsErr } = await supabase
+        .from("agency_settings")
+        .select("meta_lead_forms")
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (settingsErr) {
+        console.error("Warning: Error fetching agency_settings:", settingsErr);
+      }
+
+      const approvedForms: Array<{ id: string; name: string; status?: string; page_id?: string }> =
+        Array.isArray(settingsRow?.meta_lead_forms) ? settingsRow.meta_lead_forms : [];
+
+      matchedForm = approvedForms.find((f) => String(f.id).trim() === incomingFormId) || null;
+
+      // If form is not approved, discard to prevent hiring or unrelated forms from entering leads
+      if (!matchedForm) {
+        console.warn(`[meta-lead-webhook] Discarded lead from unapproved form ID '${incomingFormId}'`);
+        return json({
+          success: true,
+          ignored: true,
+          reason: "unapproved_form",
+          message: `Lead ignored: Form ID '${incomingFormId}' is not an approved Meta lead form.`,
+        }, 200);
+      }
+
+      // If form is approved but deactivated, discard
+      if (matchedForm.status === "inactive") {
+        console.warn(`[meta-lead-webhook] Discarded lead from deactivated form ID '${incomingFormId}' (${matchedForm.name})`);
+        return json({
+          success: true,
+          ignored: true,
+          reason: "inactive_form",
+          message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is currently deactivated.`,
+        }, 200);
+      }
+    }
+
+    // 6. Compile Notes with Meta form & campaign metadata
+    const notesParts: string[] = [];
+    if (body.notes && typeof body.notes === "string" && body.notes.trim()) {
+      notesParts.push(body.notes.trim());
+    }
+
+    const metaContext: string[] = [];
+    const formDisplayName = matchedForm?.name || body.form_name;
+    if (formDisplayName) metaContext.push(`Form: ${formDisplayName}`);
+    if (incomingFormId) metaContext.push(`Form ID: ${incomingFormId}`);
+    const pageIdentifier = body.page_id || matchedForm?.page_id;
+    if (pageIdentifier) metaContext.push(`Page ID: ${pageIdentifier}`);
+    if (body.campaign_name) metaContext.push(`Campaign: ${body.campaign_name}`);
+    if (body.campaign_id) metaContext.push(`Campaign ID: ${body.campaign_id}`);
+    if (body.ad_name) metaContext.push(`Ad: ${body.ad_name}`);
+    if (body.adset_name) metaContext.push(`Adset: ${body.adset_name}`);
+    if (fromFieldData.unmapped.length > 0) {
+      metaContext.push(...fromFieldData.unmapped);
+    }
+
+    if (metaContext.length > 0) {
+      if (notesParts.length > 0) notesParts.push("");
+      notesParts.push("--- Meta Form Data ---");
+      notesParts.push(...metaContext);
+    }
+    const compiledNotes = notesParts.join("\n");
 
     // 5. Salesperson Round-Robin Assignment
     let assignedTo: string | null = null;

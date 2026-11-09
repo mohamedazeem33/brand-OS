@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
-    "test": "node tests/meta-lead-webhook.test.mjs"
+    "test": "node tests/meta-lead-webhook.test.mjs && node tests/team-admin-credentials.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

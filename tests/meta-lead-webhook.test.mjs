@@ -153,5 +153,203 @@ console.log("PASS: Accept valid secret via x-webhook-secret and Authorization: B
 }
 console.log("PASS: Meta field_data extraction, field mapping, and unmapped metadata");
 
-console.log("\nALL WEBHOOK AUTHENTICATION AND PROCESSING TESTS PASSED SUCCESSFULLY (6/6).");
+// 7. Meta Instant Form URL Parsing
+function parseMetaInstantFormUrl(input) {
+  if (!input || !input.trim()) {
+    return { isValid: false, formId: null, pageId: null, error: "Please enter a Meta Instant Form link or Form ID." };
+  }
+
+  const raw = input.trim();
+  if (/^\d{14,18}$/.test(raw)) {
+    return { isValid: true, formId: raw, pageId: null };
+  }
+
+  try {
+    const urlString = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const url = new URL(urlString);
+    const hostname = url.hostname.toLowerCase();
+    const isMetaDomain =
+      hostname === "facebook.com" ||
+      hostname.endsWith(".facebook.com") ||
+      hostname === "meta.com" ||
+      hostname.endsWith(".meta.com") ||
+      hostname === "fb.me" ||
+      hostname.endsWith(".fb.me") ||
+      hostname === "fb.com" ||
+      hostname.endsWith(".fb.com") ||
+      hostname === "instagram.com" ||
+      hostname.endsWith(".instagram.com");
+
+    if (!isMetaDomain) {
+      return { isValid: false, formId: null, pageId: null, error: "URL must belong to a Meta/Facebook domain." };
+    }
+
+    let formId = null;
+    let pageId = null;
+
+    const params = url.searchParams;
+    for (const key of ["id", "form_id", "leadgen_id", "selected_form_id", "lead_gen_id", "form"]) {
+      const val = params.get(key);
+      if (val && /^\d{14,18}$/.test(val)) {
+        formId = val;
+        break;
+      }
+    }
+
+    for (const key of ["page_id", "asset_id", "page", "business_id"]) {
+      const val = params.get(key);
+      if (val && /^\d{10,18}$/.test(val)) {
+        pageId = val;
+        break;
+      }
+    }
+
+    if (!formId) {
+      const segments = url.pathname.split("/").filter(Boolean);
+      for (const seg of segments) {
+        if (/^\d{14,18}$/.test(seg)) {
+          formId = seg;
+          break;
+        }
+      }
+    }
+
+    if (!formId) {
+      return { isValid: false, formId: null, pageId: null, error: "Could not detect a valid 14-18 digit Meta Form ID." };
+    }
+
+    return { isValid: true, formId, pageId };
+  } catch {
+    return { isValid: false, formId: null, pageId: null, error: "Invalid URL format." };
+  }
+}
+
+{
+  // Standard Facebook Instant Form link
+  const r1 = parseMetaInstantFormUrl("https://www.facebook.com/ads/leadgen/?id=1650833669757581");
+  assert.equal(r1.isValid, true);
+  assert.equal(r1.formId, "1650833669757581");
+  assert.equal(r1.pageId, null);
+
+  // Link with both form_id and page_id
+  const r2 = parseMetaInstantFormUrl("https://facebook.com/ads/lead_gen/?id=1650833669757581&page_id=104523992487431");
+  assert.equal(r2.isValid, true);
+  assert.equal(r2.formId, "1650833669757581");
+  assert.equal(r2.pageId, "104523992487431");
+
+  // Meta Business Suite form URL
+  const r3 = parseMetaInstantFormUrl("https://business.facebook.com/latest/instant_forms/forms/1650833669757581?asset_id=104523992487431");
+  assert.equal(r3.isValid, true);
+  assert.equal(r3.formId, "1650833669757581");
+  assert.equal(r3.pageId, "104523992487431");
+
+  // Direct numeric Form ID (16 digits)
+  const r4 = parseMetaInstantFormUrl("1650833669757581");
+  assert.equal(r4.isValid, true);
+  assert.equal(r4.formId, "1650833669757581");
+
+  // Instagram lead form URL
+  const r5 = parseMetaInstantFormUrl("https://www.instagram.com/leadgen/?id=1650833669757581");
+  assert.equal(r5.isValid, true);
+  assert.equal(r5.formId, "1650833669757581");
+
+  // Reject non-Meta domains
+  const r6 = parseMetaInstantFormUrl("https://google.com/search?q=1650833669757581");
+  assert.equal(r6.isValid, false);
+  assert.match(r6.error, /Meta\/Facebook domain/i);
+
+  // Reject Meta link with missing form ID
+  const r7 = parseMetaInstantFormUrl("https://facebook.com/tahamedia/about");
+  assert.equal(r7.isValid, false);
+  assert.match(r7.error, /Could not detect/i);
+
+  // Reject empty input
+  const r8 = parseMetaInstantFormUrl("   ");
+  assert.equal(r8.isValid, false);
+}
+console.log("PASS: Meta Instant Form URL validation and ID extraction (valid, invalid, query params, path)");
+
+// 8. Approved Forms Validation & Pipeline Protection
+function validateApprovedLeadForm(incomingFormId, approvedForms) {
+  if (!incomingFormId) {
+    return { allowed: true, reason: null, matchedForm: null };
+  }
+
+  const cleanId = String(incomingFormId).trim();
+  const matched = approvedForms.find((f) => String(f.id).trim() === cleanId) || null;
+
+  if (!matched) {
+    return {
+      allowed: false,
+      reason: "unapproved_form",
+      message: `Lead ignored: Form ID '${cleanId}' is not an approved Meta lead form.`,
+    };
+  }
+
+  if (matched.status === "inactive") {
+    return {
+      allowed: false,
+      reason: "inactive_form",
+      message: `Lead ignored: Form '${matched.name}' (${cleanId}) is currently deactivated.`,
+    };
+  }
+
+  return { allowed: true, reason: null, matchedForm: matched };
+}
+
+{
+  const mockApprovedForms = [
+    { id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active" },
+    { id: "2222333344445555", name: "Old Performance Campaign", status: "inactive" },
+  ];
+
+  // Active approved form is accepted
+  const checkActive = validateApprovedLeadForm("1650833669757581", mockApprovedForms);
+  assert.equal(checkActive.allowed, true);
+  assert.equal(checkActive.matchedForm?.name, "Taha Media - Client Enquiry Form");
+
+  // Deactivated form is ignored
+  const checkInactive = validateApprovedLeadForm("2222333344445555", mockApprovedForms);
+  assert.equal(checkInactive.allowed, false);
+  assert.equal(checkInactive.reason, "inactive_form");
+
+  // Unapproved form (e.g. hiring/internship form) is rejected
+  const checkUnapproved = validateApprovedLeadForm("9999888877776666", mockApprovedForms);
+  assert.equal(checkUnapproved.allowed, false);
+  assert.equal(checkUnapproved.reason, "unapproved_form");
+
+  // Missing form ID allowed for backward compatibility
+  const checkLegacy = validateApprovedLeadForm(null, mockApprovedForms);
+  assert.equal(checkLegacy.allowed, true);
+  assert.equal(checkLegacy.matchedForm, null);
+}
+console.log("PASS: Lead delivery filtering: accepts approved active forms, discards unapproved/hiring and deactivated forms");
+
+// 9. Duplicate meta_lead_id detection
+function checkLeadDuplicate(metaLeadId, existingLeads) {
+  if (!metaLeadId) return { duplicate: false };
+  const found = existingLeads.find((l) => l.meta_lead_id === metaLeadId);
+  if (found) {
+    return {
+      duplicate: true,
+      message: `Lead with meta_lead_id '${metaLeadId}' already exists. No duplicate created.`,
+      lead: found,
+    };
+  }
+  return { duplicate: false };
+}
+
+{
+  const existing = [{ id: "lead-1", meta_lead_id: "meta-123456", name: "Existing Lead" }];
+
+  const dupRes = checkLeadDuplicate("meta-123456", existing);
+  assert.equal(dupRes.duplicate, true);
+  assert.equal(dupRes.lead.id, "lead-1");
+
+  const newRes = checkLeadDuplicate("meta-999999", existing);
+  assert.equal(newRes.duplicate, false);
+}
+console.log("PASS: Duplicate lead prevention by meta_lead_id");
+
+console.log("\nALL WEBHOOK AUTHENTICATION AND PROCESSING TESTS PASSED SUCCESSFULLY (9/9).");
 
