@@ -53,6 +53,53 @@ function adminClient() {
   });
 }
 
+const TAHA_PAGE_ID = "104523992487431";
+const FORM_ID_REGEX = /^\d{14,18}$/;
+
+/**
+ * Deterministic Canonical JSON stringification for HMAC signing.
+ * Strictly ordered keys (ASCII order):
+ * id, meta_form_name, status, verified_at, verified_by, verified_page_id
+ */
+function canonicalizeFormPayload(data: {
+  id: string;
+  meta_form_name: string;
+  status: "active" | "inactive";
+  verified_at: string;
+  verified_by: string;
+  verified_page_id: string;
+}): string {
+  return JSON.stringify({
+    id: String(data.id || "").trim(),
+    meta_form_name: String(data.meta_form_name || "").trim(),
+    status: data.status,
+    verified_at: String(data.verified_at || "").trim(),
+    verified_by: String(data.verified_by || "").trim(),
+    verified_page_id: String(data.verified_page_id || "").trim(),
+  });
+}
+
+/**
+ * Computes HMAC-SHA256 hex signature using Web Crypto API.
+ */
+async function computeFormRegistryHmac(
+  canonicalPayload: string,
+  secretKey: string
+): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secretKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(canonicalPayload));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 interface MetaFieldData {
   name: string;
   values?: string[];
@@ -199,9 +246,113 @@ Deno.serve(async (req: Request) => {
       receivedAt = new Date().toISOString();
     }
 
+    // 4. Require & Validate Page ID (Consistency pre-filter)
+    const incomingPageId = (body.page_id ?? body.pageId ?? "").toString().trim();
+    if (!incomingPageId || incomingPageId !== TAHA_PAGE_ID) {
+      console.warn(`[meta-lead-webhook] Discarded lead: Invalid or missing page_id '${incomingPageId}'`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "invalid_or_missing_page_id",
+        message: `Lead ignored: page_id is required and must match Taha Media Page ID (${TAHA_PAGE_ID}).`,
+      }, 200);
+    }
+
+    // 5. Require & Validate Form ID (Strict numeric format, NEVER substitute leadgen_id)
+    const rawFormId = (body.form_id ?? body.formId ?? "").toString().trim();
+    if (!rawFormId || !FORM_ID_REGEX.test(rawFormId)) {
+      console.warn(`[meta-lead-webhook] Discarded lead: Invalid or missing form_id '${rawFormId}'`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "invalid_or_missing_form_id",
+        message: "Lead ignored: form_id is required and must be a valid 14-18 digit numeric ID.",
+      }, 200);
+    }
+    const incomingFormId = rawFormId;
+
     const supabase = adminClient();
 
-    // 4. Duplicate Check by meta_lead_id
+    // 6. Whitelist & Canonical HMAC Verification (Executed BEFORE duplicate check and salesperson assignment)
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from("agency_settings")
+      .select("meta_lead_forms")
+      .order("id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (settingsErr) {
+      console.error("Warning: Error fetching agency_settings:", settingsErr);
+    }
+
+    const approvedForms: any[] = Array.isArray(settingsRow?.meta_lead_forms) ? settingsRow.meta_lead_forms : [];
+    const matchedForm = approvedForms.find((f) => String(f.id).trim() === incomingFormId) || null;
+
+    if (!matchedForm) {
+      console.warn(`[meta-lead-webhook] Discarded lead from unapproved form ID '${incomingFormId}'`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "unapproved_form",
+        message: `Lead ignored: Form ID '${incomingFormId}' is not an approved Meta lead form.`,
+      }, 200);
+    }
+
+    // Check if form is explicitly deactivated
+    if (matchedForm.status === "inactive") {
+      console.warn(`[meta-lead-webhook] Discarded lead from deactivated form ID '${incomingFormId}' (${matchedForm.name})`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "inactive_form",
+        message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is currently deactivated.`,
+      }, 200);
+    }
+
+    // Defense-in-depth: Verify Page ID attribution stored in registry
+    if (matchedForm.verified_page_id && matchedForm.verified_page_id !== TAHA_PAGE_ID) {
+      console.warn(`[meta-lead-webhook] Discarded lead: Form '${incomingFormId}' attributed to foreign Page '${matchedForm.verified_page_id}'`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "invalid_form_page_attribution",
+        message: `Lead ignored: Form '${incomingFormId}' belongs to an unapproved Page.`,
+      }, 200);
+    }
+
+    // Verify HMAC signature if record has verification_sig or if HMAC secret is configured
+    const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET");
+    if (hmacSecret && matchedForm.verification_sig) {
+      const canonicalPayload = canonicalizeFormPayload({
+        id: matchedForm.id,
+        meta_form_name: matchedForm.meta_form_name || matchedForm.name,
+        status: matchedForm.status,
+        verified_at: matchedForm.verified_at,
+        verified_by: matchedForm.verified_by,
+        verified_page_id: matchedForm.verified_page_id || TAHA_PAGE_ID,
+      });
+      const expectedSig = await computeFormRegistryHmac(canonicalPayload, hmacSecret);
+      if (!secureCompare(matchedForm.verification_sig, expectedSig)) {
+        console.error(`[meta-lead-webhook] SECURITY ALERT: Form '${incomingFormId}' failed canonical HMAC verification. Possible database tampering or unauthorized status modification.`);
+        return json({
+          success: true,
+          ignored: true,
+          reason: "tampered_or_unverified_form_record",
+          message: `Lead ignored: Form '${incomingFormId}' failed cryptographic verification check.`,
+        }, 200);
+      }
+    }
+
+    if (matchedForm.status !== "active") {
+      return json({
+        success: true,
+        ignored: true,
+        reason: "inactive_form",
+        message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is not active.`,
+      }, 200);
+    }
+
+    // 7. Duplicate Check by meta_lead_id (Executed AFTER whitelist verification)
     if (metaLeadId) {
       const { data: existingLead, error: lookupErr } = await supabase
         .from("leads")
@@ -217,52 +368,6 @@ Deno.serve(async (req: Request) => {
           duplicate: true,
           message: `Lead with meta_lead_id '${metaLeadId}' already exists. No duplicate created.`,
           lead: existingLead,
-        }, 200);
-      }
-    }
-
-    // 5. Approved Forms Validation & Routing
-    // Protects the client pipeline by discarding unapproved forms (e.g. hiring/unrelated campaigns)
-    // or deactivated forms.
-    const incomingFormId = (body.form_id ?? body.formId ?? body.leadgen_id ?? "").toString().trim() || null;
-    let matchedForm: { id: string; name: string; status?: string; page_id?: string } | null = null;
-
-    if (incomingFormId) {
-      const { data: settingsRow, error: settingsErr } = await supabase
-        .from("agency_settings")
-        .select("meta_lead_forms")
-        .order("id", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (settingsErr) {
-        console.error("Warning: Error fetching agency_settings:", settingsErr);
-      }
-
-      const approvedForms: Array<{ id: string; name: string; status?: string; page_id?: string }> =
-        Array.isArray(settingsRow?.meta_lead_forms) ? settingsRow.meta_lead_forms : [];
-
-      matchedForm = approvedForms.find((f) => String(f.id).trim() === incomingFormId) || null;
-
-      // If form is not approved, discard to prevent hiring or unrelated forms from entering leads
-      if (!matchedForm) {
-        console.warn(`[meta-lead-webhook] Discarded lead from unapproved form ID '${incomingFormId}'`);
-        return json({
-          success: true,
-          ignored: true,
-          reason: "unapproved_form",
-          message: `Lead ignored: Form ID '${incomingFormId}' is not an approved Meta lead form.`,
-        }, 200);
-      }
-
-      // If form is approved but deactivated, discard
-      if (matchedForm.status === "inactive") {
-        console.warn(`[meta-lead-webhook] Discarded lead from deactivated form ID '${incomingFormId}' (${matchedForm.name})`);
-        return json({
-          success: true,
-          ignored: true,
-          reason: "inactive_form",
-          message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is currently deactivated.`,
         }, 200);
       }
     }

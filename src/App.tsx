@@ -16,6 +16,7 @@ import {
   Clock,
   Clock3,
   Copy,
+  Edit2,
   Eye,
   EyeOff,
   FileText,
@@ -53,6 +54,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
+import { parseMetaInstantFormUrl } from '@/lib/metaFormParser';
 
 type Profile = { id: string; email: string; full_name: string; role: string; is_active: boolean };
 
@@ -2601,11 +2603,17 @@ function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profi
 type MetaLeadForm = {
   id: string;
   name: string;
+  meta_form_name?: string;
   status?: string;
   connection_status?: 'saved' | 'connected' | 'receiving_leads';
   page_id?: string;
+  verified_page_id?: string;
+  verified_at?: string;
+  verified_by?: string;
+  verification_sig?: string;
   source_url?: string;
   created_at?: string;
+  updated_at?: string;
 };
 
 type AgencySettings = {
@@ -2660,8 +2668,20 @@ function SettingsPage({
   const [removeLogo, setRemoveLogo] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Meta Instant Form placeholder state
+  // Meta Instant Form manager state
   const [instantFormLink, setInstantFormLink] = useState('');
+  const [instantFormName, setInstantFormName] = useState('');
+  const [verifyingForm, setVerifyingForm] = useState(false);
+  const [formFeedback, setFormFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [editingFormId, setEditingFormId] = useState<string | null>(null);
+  const [editingFormName, setEditingFormName] = useState('');
+  const [formActionInProgress, setFormActionInProgress] = useState<string | null>(null);
+
+  // Real-time link validation and ID extraction
+  const parsedFormLink = useMemo(() => {
+    if (!instantFormLink.trim()) return null;
+    return parseMetaInstantFormUrl(instantFormLink);
+  }, [instantFormLink]);
 
   // General state
   const [loading, setLoading] = useState(true);
@@ -2883,6 +2903,167 @@ function SettingsPage({
       setRemoveLogo(false);
     }
     setShowCancelModal(false);
+  };
+
+  // Meta Lead Form Manager actions via Admin backend service
+  const handleAddForm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!instantFormLink.trim()) return;
+
+    setVerifyingForm(true);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        body: {
+          action: 'verify_and_register_meta_form',
+          form_url: instantFormLink.trim(),
+          custom_name: instantFormName.trim(),
+        },
+      });
+
+      if (fnError || !data?.success) {
+        const errorMsg = data?.error || fnError?.message || 'Verification failed.';
+        setFormFeedback({
+          type: 'error',
+          message: errorMsg,
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || `Form verified with Meta and registered successfully.`,
+      });
+      setInstantFormLink('');
+      setInstantFormName('');
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      console.error('Error verifying form:', err);
+      setFormFeedback({
+        type: 'error',
+        message: err.message || 'An unexpected error occurred during form verification.',
+      });
+    } finally {
+      setVerifyingForm(false);
+    }
+  };
+
+  const handleToggleFormStatus = async (formItem: MetaLeadForm) => {
+    const nextStatus = formItem.status === 'active' ? 'inactive' : 'active';
+    setFormActionInProgress(formItem.id);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        body: {
+          action: 'set_meta_form_status',
+          form_id: formItem.id,
+          status: nextStatus,
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to update form status.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || `Form status updated to ${nextStatus}.`,
+      });
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error updating form status.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
+  };
+
+  const handleSaveRename = async (formId: string) => {
+    if (!editingFormName.trim()) return;
+    setFormActionInProgress(formId);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        body: {
+          action: 'rename_meta_form',
+          form_id: formId,
+          new_name: editingFormName.trim(),
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to rename form.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || 'Form renamed successfully.',
+      });
+      setEditingFormId(null);
+      setEditingFormName('');
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error renaming form.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
+  };
+
+  const handleRemoveForm = async (formItem: MetaLeadForm) => {
+    if (!window.confirm(`Are you sure you want to deactivate and remove '${formItem.name}' (${formItem.id}) from the active forms list? Historical leads will remain intact.`)) {
+      return;
+    }
+    setFormActionInProgress(formItem.id);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        body: {
+          action: 'remove_meta_form',
+          form_id: formItem.id,
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to deactivate form.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || 'Form deactivated and removed from active list.',
+      });
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error deactivating form.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
   };
 
 
@@ -3156,36 +3337,200 @@ function SettingsPage({
           {activeSection === 'integrations' && (
             <div>
               <div className="settings-section-header">
-                <h2>Meta Instant Form</h2>
-                <p>Add an Instant Form link for future lead integration.</p>
+                <h2>Meta Instant Form Manager</h2>
+                <p>Register, verify, and manage Facebook Instant Forms authorized to feed sales leads into Taha Media.</p>
               </div>
 
+              {formFeedback && (
+                <div className={`settings-alert ${formFeedback.type === 'error' ? 'error' : 'success'}`} style={{ marginBottom: 18 }}>
+                  {formFeedback.type === 'error' ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}
+                  <span>{formFeedback.message}</span>
+                </div>
+              )}
+
+              {/* Add Form Link Card */}
               <div className="meta-link-input-card">
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!instantFormLink.trim()) return;
-                    setInstantFormLink('');
-                  }}
-                  className="meta-link-input-row"
-                >
+                <form onSubmit={handleAddForm} className="meta-link-input-row">
                   <div className="meta-link-input-fields">
                     <input
                       type="text"
-                      placeholder="Paste Meta Instant Form link"
+                      placeholder="Paste Meta Instant Form link or numeric Form ID"
                       value={instantFormLink}
                       onChange={(e) => setInstantFormLink(e.target.value)}
+                      disabled={verifyingForm}
                     />
+                    <input
+                      type="text"
+                      placeholder="Custom display name (e.g. Client Enquiry Form)"
+                      value={instantFormName}
+                      onChange={(e) => setInstantFormName(e.target.value)}
+                      disabled={verifyingForm}
+                    />
+
+                    {parsedFormLink && (
+                      <div style={{ marginTop: 2 }}>
+                        {parsedFormLink.isValid ? (
+                          <span className="meta-detection-pill valid">
+                            <Check size={12} />
+                            Detected Form ID: <code>{parsedFormLink.formId}</code>
+                            {parsedFormLink.pageId && ` (Page: ${parsedFormLink.pageId})`}
+                          </span>
+                        ) : (
+                          <span className="meta-detection-pill invalid">
+                            <AlertTriangle size={12} />
+                            {parsedFormLink.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
+
                   <button
                     type="submit"
                     className="lime-button"
                     style={{ minHeight: 40, whiteSpace: 'nowrap' }}
+                    disabled={verifyingForm || !instantFormLink.trim() || (parsedFormLink !== null && !parsedFormLink.isValid)}
                   >
                     <Plus size={15} />
-                    <span>Add Form</span>
+                    <span>{verifyingForm ? 'Verifying with Meta…' : 'Add Form'}</span>
                   </button>
                 </form>
+              </div>
+
+              {/* Approved Instant Forms Listing */}
+              <div className="lead-forms-section">
+                <div className="lead-forms-header" style={{ marginBottom: 14 }}>
+                  <div>
+                    <h3 style={{ fontSize: 15, fontWeight: 600, margin: '0 0 4px', color: '#20221d' }}>Approved Instant Forms</h3>
+                    <p style={{ fontSize: 12, color: '#687064', margin: 0 }}>
+                      Only active forms verified to belong to Taha Media Page <code>104523992487431</code> create CRM leads.
+                    </p>
+                  </div>
+                </div>
+
+                {(!settings?.meta_lead_forms || settings.meta_lead_forms.length === 0) ? (
+                  <div className="empty-state-box" style={{ padding: '30px 20px', textAlign: 'center', background: '#fafbf8', borderRadius: 8, border: '1px dashed #dcdfd5' }}>
+                    <p style={{ margin: 0, color: '#687064', fontSize: 13 }}>No approved Instant Forms registered yet. Paste a Meta Form link above to register your first campaign form.</p>
+                  </div>
+                ) : (
+                  <div className="meta-forms-list" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {settings.meta_lead_forms.map((formItem) => {
+                      const isEditing = editingFormId === formItem.id;
+                      const isActive = formItem.status === 'active';
+                      const isBusy = formActionInProgress === formItem.id;
+
+                      return (
+                        <div key={formItem.id} className="meta-form-row">
+                          <div className="meta-form-info" style={{ flex: 1 }}>
+                            <div className="meta-form-icon">
+                              <FileText size={16} />
+                            </div>
+                            <div className="meta-form-text" style={{ flex: 1 }}>
+                              {isEditing ? (
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+                                  <input
+                                    type="text"
+                                    value={editingFormName}
+                                    onChange={(e) => setEditingFormName(e.target.value)}
+                                    style={{ fontSize: 13, padding: '4px 8px', maxWidth: 280 }}
+                                    autoFocus
+                                  />
+                                  <button
+                                    type="button"
+                                    className="lime-button"
+                                    style={{ padding: '4px 10px', fontSize: 11, minHeight: 28 }}
+                                    disabled={isBusy || !editingFormName.trim()}
+                                    onClick={() => handleSaveRename(formItem.id)}
+                                  >
+                                    Save
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="outline-button"
+                                    style={{ padding: '4px 10px', fontSize: 11, minHeight: 28 }}
+                                    disabled={isBusy}
+                                    onClick={() => setEditingFormId(null)}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <>
+                                  <div className="meta-form-name-row">
+                                    <strong style={{ fontSize: 13, color: '#20221d' }}>{formItem.name}</strong>
+                                    {formItem.meta_form_name && formItem.meta_form_name !== formItem.name && (
+                                      <small style={{ fontSize: 11, color: '#7b8375' }}>({formItem.meta_form_name})</small>
+                                    )}
+                                  </div>
+                                  <div className="meta-form-id-meta">
+                                    <span>Form ID: <code>{formItem.id}</code></span>
+                                    <span>•</span>
+                                    <span>Page: <code>{formItem.verified_page_id || formItem.page_id || '104523992487431'}</code></span>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="meta-form-actions" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <span className={`system-status-pill ${isActive ? 'verified' : 'unverified'}`}>
+                              {isActive ? 'Active' : 'Inactive'}
+                            </span>
+
+                            <button
+                              type="button"
+                              className="outline-button"
+                              style={{ fontSize: 11, padding: '4px 10px', minHeight: 28 }}
+                              disabled={isBusy}
+                              onClick={() => handleToggleFormStatus(formItem)}
+                              title={isActive ? 'Deactivate form' : 'Activate form'}
+                            >
+                              {isActive ? 'Deactivate' : 'Activate'}
+                            </button>
+
+                            {!isEditing && (
+                              <button
+                                type="button"
+                                className="icon-button"
+                                title="Rename form"
+                                disabled={isBusy}
+                                onClick={() => {
+                                  setEditingFormId(formItem.id);
+                                  setEditingFormName(formItem.name);
+                                }}
+                              >
+                                <Edit2 size={14} style={{ color: '#4a5240' }} />
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              className="icon-button"
+                              title="Remove form from active list"
+                              disabled={isBusy}
+                              onClick={() => handleRemoveForm(formItem)}
+                            >
+                              <Trash2 size={14} style={{ color: '#99544a' }} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="meta-info-card">
+                  <div className="meta-info-card-icon">
+                    <ShieldCheck size={20} />
+                  </div>
+                  <div className="meta-info-card-content">
+                    <h4>Cryptographic Whitelist Protection</h4>
+                    <p>
+                      Every approved form is verified with Meta Graph API v26.0 and sealed with a backend cryptographic signature.
+                      Submissions from unapproved, deactivated, or foreign-page forms are automatically discarded to prevent recruitment or irrelevant forms from entering your sales pipeline.
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
           )}

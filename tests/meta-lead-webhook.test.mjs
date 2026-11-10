@@ -269,20 +269,38 @@ function parseMetaInstantFormUrl(input) {
 }
 console.log("PASS: Meta Instant Form URL validation and ID extraction (valid, invalid, query params, path)");
 
-// 8. Approved Forms Validation & Pipeline Protection
-function validateApprovedLeadForm(incomingFormId, approvedForms) {
-  if (!incomingFormId) {
-    return { allowed: true, reason: null, matchedForm: null };
+// 8. Strict Approved Forms Validation & Pipeline Protection
+function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms) {
+  const TAHA_PAGE_ID = "104523992487431";
+  const FORM_ID_REGEX = /^\d{14,18}$/;
+
+  // Page ID is strictly mandatory and must match Taha Media Page ID
+  const cleanPageId = (incomingPageId ?? "").toString().trim();
+  if (!cleanPageId || cleanPageId !== TAHA_PAGE_ID) {
+    return {
+      allowed: false,
+      reason: "invalid_or_missing_page_id",
+      message: `Lead ignored: page_id is required and must match Taha Media Page ID (${TAHA_PAGE_ID}).`,
+    };
   }
 
-  const cleanId = String(incomingFormId).trim();
-  const matched = approvedForms.find((f) => String(f.id).trim() === cleanId) || null;
+  // Form ID is strictly mandatory (no fallback to leadgen_id) and must be 14-18 digits
+  const cleanFormId = (incomingFormId ?? "").toString().trim();
+  if (!cleanFormId || !FORM_ID_REGEX.test(cleanFormId)) {
+    return {
+      allowed: false,
+      reason: "invalid_or_missing_form_id",
+      message: "Lead ignored: form_id is required and must be a valid 14-18 digit numeric ID.",
+    };
+  }
+
+  const matched = approvedForms.find((f) => String(f.id).trim() === cleanFormId) || null;
 
   if (!matched) {
     return {
       allowed: false,
       reason: "unapproved_form",
-      message: `Lead ignored: Form ID '${cleanId}' is not an approved Meta lead form.`,
+      message: `Lead ignored: Form ID '${cleanFormId}' is not an approved Meta lead form.`,
     };
   }
 
@@ -290,7 +308,15 @@ function validateApprovedLeadForm(incomingFormId, approvedForms) {
     return {
       allowed: false,
       reason: "inactive_form",
-      message: `Lead ignored: Form '${matched.name}' (${cleanId}) is currently deactivated.`,
+      message: `Lead ignored: Form '${matched.name}' (${cleanFormId}) is currently deactivated.`,
+    };
+  }
+
+  if (matched.verified_page_id && matched.verified_page_id !== TAHA_PAGE_ID) {
+    return {
+      allowed: false,
+      reason: "invalid_form_page_attribution",
+      message: `Lead ignored: Form '${cleanFormId}' belongs to an unapproved Page.`,
     };
   }
 
@@ -299,31 +325,52 @@ function validateApprovedLeadForm(incomingFormId, approvedForms) {
 
 {
   const mockApprovedForms = [
-    { id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active" },
-    { id: "2222333344445555", name: "Old Performance Campaign", status: "inactive" },
+    { id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active", verified_page_id: "104523992487431" },
+    { id: "2222333344445555", name: "Old Performance Campaign", status: "inactive", verified_page_id: "104523992487431" },
+    { id: "3333444455556666", name: "Foreign Page Form", status: "active", verified_page_id: "999999999999999" },
   ];
 
-  // Active approved form is accepted
-  const checkActive = validateApprovedLeadForm("1650833669757581", mockApprovedForms);
+  // Active approved form with correct page_id is accepted
+  const checkActive = validateApprovedLeadForm("1650833669757581", "104523992487431", mockApprovedForms);
   assert.equal(checkActive.allowed, true);
   assert.equal(checkActive.matchedForm?.name, "Taha Media - Client Enquiry Form");
 
   // Deactivated form is ignored
-  const checkInactive = validateApprovedLeadForm("2222333344445555", mockApprovedForms);
+  const checkInactive = validateApprovedLeadForm("2222333344445555", "104523992487431", mockApprovedForms);
   assert.equal(checkInactive.allowed, false);
   assert.equal(checkInactive.reason, "inactive_form");
 
   // Unapproved form (e.g. hiring/internship form) is rejected
-  const checkUnapproved = validateApprovedLeadForm("9999888877776666", mockApprovedForms);
+  const checkUnapproved = validateApprovedLeadForm("9999888877776666", "104523992487431", mockApprovedForms);
   assert.equal(checkUnapproved.allowed, false);
   assert.equal(checkUnapproved.reason, "unapproved_form");
 
-  // Missing form ID allowed for backward compatibility
-  const checkLegacy = validateApprovedLeadForm(null, mockApprovedForms);
-  assert.equal(checkLegacy.allowed, true);
-  assert.equal(checkLegacy.matchedForm, null);
+  // Missing form ID is rejected (NEVER bypasses validation)
+  const checkMissingFormId = validateApprovedLeadForm(null, "104523992487431", mockApprovedForms);
+  assert.equal(checkMissingFormId.allowed, false);
+  assert.equal(checkMissingFormId.reason, "invalid_or_missing_form_id");
+
+  // Malformed form ID is rejected
+  const checkMalformedFormId = validateApprovedLeadForm("abc1234", "104523992487431", mockApprovedForms);
+  assert.equal(checkMalformedFormId.allowed, false);
+  assert.equal(checkMalformedFormId.reason, "invalid_or_missing_form_id");
+
+  // Missing page ID is rejected
+  const checkMissingPageId = validateApprovedLeadForm("1650833669757581", null, mockApprovedForms);
+  assert.equal(checkMissingPageId.allowed, false);
+  assert.equal(checkMissingPageId.reason, "invalid_or_missing_page_id");
+
+  // Foreign page ID is rejected
+  const checkForeignPageId = validateApprovedLeadForm("1650833669757581", "987654321012345", mockApprovedForms);
+  assert.equal(checkForeignPageId.allowed, false);
+  assert.equal(checkForeignPageId.reason, "invalid_or_missing_page_id");
+
+  // Form record attributed to foreign page is rejected
+  const checkForeignAttribution = validateApprovedLeadForm("3333444455556666", "104523992487431", mockApprovedForms);
+  assert.equal(checkForeignAttribution.allowed, false);
+  assert.equal(checkForeignAttribution.reason, "invalid_form_page_attribution");
 }
-console.log("PASS: Lead delivery filtering: accepts approved active forms, discards unapproved/hiring and deactivated forms");
+console.log("PASS: Strict lead delivery filtering: accepts approved active forms, rejects missing/foreign page_id, missing form_id, unapproved and inactive forms");
 
 // 9. Duplicate meta_lead_id detection
 function checkLeadDuplicate(metaLeadId, existingLeads) {

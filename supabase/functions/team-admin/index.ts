@@ -59,6 +59,89 @@ function randomPassword(length = 16) {
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
+const TAHA_PAGE_ID = "104523992487431";
+const FORM_ID_REGEX = /^\d{14,18}$/;
+
+interface VerifiedMetaLeadForm {
+  id: string;
+  name: string;
+  meta_form_name: string;
+  status: "active" | "inactive";
+  page_id: string;
+  verified_page_id: string;
+  verified_at: string;
+  verified_by: string;
+  verification_sig: string;
+  source_url?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+/**
+ * Deterministic Canonical JSON stringification for HMAC signing.
+ * Strictly ordered keys (ASCII order):
+ * id, meta_form_name, status, verified_at, verified_by, verified_page_id
+ */
+function canonicalizeFormPayload(data: {
+  id: string;
+  meta_form_name: string;
+  status: "active" | "inactive";
+  verified_at: string;
+  verified_by: string;
+  verified_page_id: string;
+}): string {
+  return JSON.stringify({
+    id: String(data.id || "").trim(),
+    meta_form_name: String(data.meta_form_name || "").trim(),
+    status: data.status,
+    verified_at: String(data.verified_at || "").trim(),
+    verified_by: String(data.verified_by || "").trim(),
+    verified_page_id: String(data.verified_page_id || "").trim(),
+  });
+}
+
+/**
+ * Computes HMAC-SHA256 hex signature using Web Crypto API.
+ */
+async function computeFormRegistryHmac(
+  canonicalPayload: string,
+  secretKey: string
+): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secretKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(canonicalPayload));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Extracts 14-18 digit Meta Form ID from URLs, query params, or direct numeric string.
+ */
+function extractFormId(input: string): string | null {
+  if (!input) return null;
+  const raw = input.trim();
+  if (FORM_ID_REGEX.test(raw)) return raw;
+
+  const qMatch = raw.match(/[?&](?:id|form_id|selected_form_id)=(\d{14,18})/i);
+  if (qMatch) return qMatch[1];
+
+  const pMatch = raw.match(/\/(?:forms|leadgen)\/(\d{14,18})/i);
+  if (pMatch) return pMatch[1];
+
+  if (/facebook\.com|fb\.me|meta\.com|instagram\.com/i.test(raw)) {
+    const fbMatch = raw.match(/\b(\d{14,18})\b/);
+    if (fbMatch) return fbMatch[1];
+  }
+
+  return null;
+}
 
 /**
  * Checks for email collision across all auth users via pagination,
@@ -178,9 +261,355 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // PATCH — update role, toggle active status, or update credentials
+    // PATCH — employee account management OR Meta Lead Form management
     if (req.method === "PATCH") {
       const body = await req.json();
+
+      // ==========================================
+      // Meta Lead Form Registry Actions (Admin-only)
+      // ==========================================
+
+      // 1. Verify with Meta Graph API v26.0 and Register Form
+      if (body.action === "verify_and_register_meta_form") {
+        const rawUrl = typeof body.form_url === "string" ? body.form_url.trim() : (typeof body.form_id === "string" ? body.form_id.trim() : "");
+        const customName = typeof body.custom_name === "string" ? body.custom_name.trim() : "";
+
+        if (!rawUrl) return errorResponse("Meta Instant Form URL or Form ID is required.", 400);
+
+        const formId = extractFormId(rawUrl);
+        if (!formId || !FORM_ID_REGEX.test(formId)) {
+          return errorResponse("Could not detect a valid 14-18 digit Meta Form ID from the provided link.", 400);
+        }
+
+        // Check if META_PAGE_ACCESS_TOKEN is configured
+        const metaToken = Deno.env.get("META_PAGE_ACCESS_TOKEN");
+        if (!metaToken || !metaToken.trim()) {
+          // Rule: If a real Meta API verification requires a token that is not available locally,
+          // implement the backend integration safely and report that live verification remains pending.
+          // Do not fake a successful verification.
+          return json({
+            success: false,
+            verified: false,
+            error: "Meta verification token (META_PAGE_ACCESS_TOKEN) is not configured in Supabase Secrets. Live Meta Graph API verification remains pending.",
+            form_id: formId,
+          }, 503);
+        }
+
+        // Live verification with Meta Graph API v26.0
+        const metaApiUrl = `https://graph.facebook.com/v26.0/${formId}?fields=id,name,status,page{id,name}&access_token=${encodeURIComponent(metaToken.trim())}`;
+        let metaData: any;
+        try {
+          const metaRes = await fetch(metaApiUrl);
+          metaData = await metaRes.json();
+          if (!metaRes.ok || metaData.error) {
+            const errMsg = metaData.error?.message || `Meta Graph API returned HTTP ${metaRes.status}`;
+            return errorResponse(`Meta verification failed: ${errMsg}`, 400);
+          }
+        } catch (fetchErr: any) {
+          console.error("Meta Graph API fetch exception:", fetchErr);
+          return errorResponse(`Failed to connect to Meta Graph API: ${fetchErr.message || fetchErr}`, 502);
+        }
+
+        // Verify Page ownership
+        const pageId = metaData.page?.id ? String(metaData.page.id).trim() : null;
+        const pageName = metaData.page?.name ? String(metaData.page.name).trim() : "Unknown Page";
+        if (pageId !== TAHA_PAGE_ID) {
+          return errorResponse(
+            `Form verification failed: Form belongs to Page '${pageId}' (${pageName}), not Taha Media Page (${TAHA_PAGE_ID}).`,
+            400
+          );
+        }
+
+        // Verify Status is ACTIVE
+        const formStatus = metaData.status ? String(metaData.status).trim().toUpperCase() : "";
+        if (formStatus !== "ACTIVE") {
+          return errorResponse(
+            `Form verification failed: Form status is '${formStatus}'. Only ACTIVE Meta Instant Forms can be registered.`,
+            400
+          );
+        }
+
+        const metaFormName = metaData.name ? String(metaData.name).trim() : (customName || "Taha Media Form");
+        const displayName = customName || metaFormName;
+        const nowIso = new Date().toISOString();
+
+        // Sign with META_FORM_REGISTRY_HMAC_SECRET
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
+        const payloadToSign = canonicalizeFormPayload({
+          id: formId,
+          meta_form_name: metaFormName,
+          status: "active",
+          verified_at: nowIso,
+          verified_by: admin.id,
+          verified_page_id: TAHA_PAGE_ID,
+        });
+
+        let verificationSig = "";
+        if (hmacSecret) {
+          verificationSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        }
+
+        // Fetch existing forms array
+        const { data: settingsRow, error: fetchErr } = await supabase
+          .from("agency_settings")
+          .select("meta_lead_forms")
+          .order("id", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (fetchErr) {
+          return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+        }
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        // Check if form already exists
+        const existingIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        const newRecord: VerifiedMetaLeadForm = {
+          id: formId,
+          name: displayName,
+          meta_form_name: metaFormName,
+          status: "active",
+          page_id: TAHA_PAGE_ID,
+          verified_page_id: TAHA_PAGE_ID,
+          verified_at: nowIso,
+          verified_by: admin.id,
+          verification_sig: verificationSig,
+          source_url: rawUrl.startsWith("http") ? rawUrl : undefined,
+          created_at: existingIdx >= 0 ? existingForms[existingIdx].created_at || nowIso : nowIso,
+          updated_at: nowIso,
+        };
+
+        let updatedList: VerifiedMetaLeadForm[];
+        if (existingIdx >= 0) {
+          updatedList = [...existingForms];
+          updatedList[existingIdx] = newRecord;
+        } else {
+          updatedList = [...existingForms, newRecord];
+        }
+
+        // Update agency_settings with service_role client
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", "default");
+
+        if (updateErr) {
+          return errorResponse("Failed to save verified form to registry: " + updateErr.message, 500);
+        }
+
+        return json({
+          success: true,
+          verified: true,
+          message: `Form '${displayName}' verified with Meta Page ${TAHA_PAGE_ID} and registered successfully.`,
+          form: newRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 2. Set Status (Activate / Deactivate) with HMAC re-signing
+      if (body.action === "set_meta_form_status") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        const nextStatus = body.status === "active" ? "active" : (body.status === "inactive" ? "inactive" : null);
+
+        if (!formId || !FORM_ID_REGEX.test(formId)) {
+          return errorResponse("Valid Form ID is required.", 400);
+        }
+        if (!nextStatus) {
+          return errorResponse("status must be 'active' or 'inactive'.", 400);
+        }
+
+        const { data: settingsRow, error: fetchErr } = await supabase
+          .from("agency_settings")
+          .select("meta_lead_forms")
+          .order("id", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) {
+          return errorResponse("Form ID not found in registry.", 404);
+        }
+
+        const target = existingForms[targetIdx];
+        const nowIso = new Date().toISOString();
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
+
+        let newSig = target.verification_sig || "";
+        if (hmacSecret) {
+          const payloadToSign = canonicalizeFormPayload({
+            id: target.id,
+            meta_form_name: target.meta_form_name || target.name,
+            status: nextStatus,
+            verified_at: target.verified_at || nowIso,
+            verified_by: admin.id,
+            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          });
+          newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        }
+
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...target,
+          status: nextStatus,
+          verification_sig: newSig,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", "default");
+
+        if (updateErr) return errorResponse("Failed to update form status: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form '${target.name}' status set to ${nextStatus}.`,
+          form: updatedRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 3. Rename Form Custom Display Label
+      if (body.action === "rename_meta_form") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        const newName = typeof body.new_name === "string" ? body.new_name.trim() : "";
+
+        if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
+        if (!newName) return errorResponse("New form name is required.", 400);
+
+        const { data: settingsRow, error: fetchErr } = await supabase
+          .from("agency_settings")
+          .select("meta_lead_forms")
+          .order("id", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
+
+        const nowIso = new Date().toISOString();
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...existingForms[targetIdx],
+          name: newName,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", "default");
+
+        if (updateErr) return errorResponse("Failed to rename form: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form renamed to '${newName}'.`,
+          form: updatedRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 4. Remove Form (Archives to inactive with HMAC sealing to preserve attribution)
+      if (body.action === "remove_meta_form") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
+
+        const { data: settingsRow, error: fetchErr } = await supabase
+          .from("agency_settings")
+          .select("meta_lead_forms")
+          .order("id", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
+
+        const nowIso = new Date().toISOString();
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
+
+        let newSig = existingForms[targetIdx].verification_sig || "";
+        if (hmacSecret) {
+          const payloadToSign = canonicalizeFormPayload({
+            id: existingForms[targetIdx].id,
+            meta_form_name: existingForms[targetIdx].meta_form_name || existingForms[targetIdx].name,
+            status: "inactive",
+            verified_at: existingForms[targetIdx].verified_at || nowIso,
+            verified_by: admin.id,
+            verified_page_id: existingForms[targetIdx].verified_page_id || TAHA_PAGE_ID,
+          });
+          newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        }
+
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...existingForms[targetIdx],
+          status: "inactive",
+          verification_sig: newSig,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", "default");
+
+        if (updateErr) return errorResponse("Failed to deactivate form: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form '${existingForms[targetIdx].name}' deactivated and removed from active list.`,
+          forms: updatedList,
+        });
+      }
+
+      // ==========================================
+      // Employee Account Actions (require user_id)
+      // ==========================================
       const userId = typeof body.user_id === "string" ? body.user_id.trim() : "";
 
       if (!userId || !UUID_REGEX.test(userId)) {
