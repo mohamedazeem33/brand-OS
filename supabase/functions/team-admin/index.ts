@@ -281,6 +281,15 @@ Deno.serve(async (req: Request) => {
           return errorResponse("Could not detect a valid 14-18 digit Meta Form ID from the provided link.", 400);
         }
 
+        // Require META_FORM_REGISTRY_HMAC_SECRET (Fail-closed)
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse(
+            "Cryptographic signing key (META_FORM_REGISTRY_HMAC_SECRET) is not configured in Supabase Secrets. Cannot register form without cryptographic sealing.",
+            500
+          );
+        }
+
         // Check if META_PAGE_ACCESS_TOKEN is configured
         const metaToken = Deno.env.get("META_PAGE_ACCESS_TOKEN");
         if (!metaToken || !metaToken.trim()) {
@@ -334,7 +343,6 @@ Deno.serve(async (req: Request) => {
         const nowIso = new Date().toISOString();
 
         // Sign with META_FORM_REGISTRY_HMAC_SECRET
-        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
         const payloadToSign = canonicalizeFormPayload({
           id: formId,
           meta_form_name: metaFormName,
@@ -344,21 +352,35 @@ Deno.serve(async (req: Request) => {
           verified_page_id: TAHA_PAGE_ID,
         });
 
-        let verificationSig = "";
-        if (hmacSecret) {
-          verificationSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        const verificationSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        if (!verificationSig) {
+          return errorResponse("Failed to compute cryptographic signature for form.", 500);
         }
 
-        // Fetch existing forms array
-        const { data: settingsRow, error: fetchErr } = await supabase
+        // Fetch existing forms array targeting default row
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
           .from("agency_settings")
-          .select("meta_lead_forms")
-          .order("id", { ascending: true })
-          .limit(1)
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
           .maybeSingle();
 
-        if (fetchErr) {
-          return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) {
+            return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          }
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
         }
 
         const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
@@ -398,7 +420,7 @@ Deno.serve(async (req: Request) => {
             updated_at: nowIso,
             updated_by: admin.id,
           })
-          .eq("id", "default");
+          .eq("id", targetSettingsId);
 
         if (updateErr) {
           return errorResponse("Failed to save verified form to registry: " + updateErr.message, 500);
@@ -413,7 +435,7 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      // 2. Set Status (Activate / Deactivate) with HMAC re-signing
+      // 2. Set Status (Activate / Deactivate) with HMAC re-signing & tamper check
       if (body.action === "set_meta_form_status") {
         const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
         const nextStatus = body.status === "active" ? "active" : (body.status === "inactive" ? "inactive" : null);
@@ -425,14 +447,36 @@ Deno.serve(async (req: Request) => {
           return errorResponse("status must be 'active' or 'inactive'.", 400);
         }
 
-        const { data: settingsRow, error: fetchErr } = await supabase
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse(
+            "Cryptographic signing key (META_FORM_REGISTRY_HMAC_SECRET) is not configured in Supabase Secrets. Cannot update form status.",
+            500
+          );
+        }
+
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
           .from("agency_settings")
-          .select("meta_lead_forms")
-          .order("id", { ascending: true })
-          .limit(1)
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
           .maybeSingle();
 
-        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
 
         const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
           ? settingsRow.meta_lead_forms
@@ -444,21 +488,41 @@ Deno.serve(async (req: Request) => {
         }
 
         const target = existingForms[targetIdx];
-        const nowIso = new Date().toISOString();
-        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
 
-        let newSig = target.verification_sig || "";
-        if (hmacSecret) {
-          const payloadToSign = canonicalizeFormPayload({
-            id: target.id,
-            meta_form_name: target.meta_form_name || target.name,
-            status: nextStatus,
-            verified_at: target.verified_at || nowIso,
-            verified_by: admin.id,
-            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
-          });
-          newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        // Anti-tampering check: Form must have an existing valid signature before status transition
+        if (!target.verification_sig || typeof target.verification_sig !== "string" || !target.verification_sig.trim()) {
+          return errorResponse(
+            "Cannot update status: Form record is unsigned or missing cryptographic verification. It must be re-verified through Meta Graph API before activating.",
+            403
+          );
         }
+
+        const existingCanonical = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: target.meta_form_name || target.name,
+          status: target.status,
+          verified_at: target.verified_at,
+          verified_by: target.verified_by,
+          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+        });
+        const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+        if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+          return errorResponse(
+            "Cannot update status: Form record failed cryptographic integrity check. Possible database tampering detected.",
+            403
+          );
+        }
+
+        const nowIso = new Date().toISOString();
+        const payloadToSign = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: target.meta_form_name || target.name,
+          status: nextStatus,
+          verified_at: target.verified_at || nowIso,
+          verified_by: admin.id,
+          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+        });
+        const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
 
         const updatedRecord: VerifiedMetaLeadForm = {
           ...target,
@@ -477,7 +541,7 @@ Deno.serve(async (req: Request) => {
             updated_at: nowIso,
             updated_by: admin.id,
           })
-          .eq("id", "default");
+          .eq("id", targetSettingsId);
 
         if (updateErr) return errorResponse("Failed to update form status: " + updateErr.message, 500);
 
@@ -497,14 +561,28 @@ Deno.serve(async (req: Request) => {
         if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
         if (!newName) return errorResponse("New form name is required.", 400);
 
-        const { data: settingsRow, error: fetchErr } = await supabase
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
           .from("agency_settings")
-          .select("meta_lead_forms")
-          .order("id", { ascending: true })
-          .limit(1)
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
           .maybeSingle();
 
-        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
 
         const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
           ? settingsRow.meta_lead_forms
@@ -513,9 +591,29 @@ Deno.serve(async (req: Request) => {
         const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
         if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
 
+        const target = existingForms[targetIdx];
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (hmacSecret && target.verification_sig) {
+          const existingCanonical = canonicalizeFormPayload({
+            id: target.id,
+            meta_form_name: target.meta_form_name || target.name,
+            status: target.status,
+            verified_at: target.verified_at,
+            verified_by: target.verified_by,
+            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          });
+          const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+          if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+            return errorResponse(
+              "Cannot rename form: Form record failed cryptographic integrity check.",
+              403
+            );
+          }
+        }
+
         const nowIso = new Date().toISOString();
         const updatedRecord: VerifiedMetaLeadForm = {
-          ...existingForms[targetIdx],
+          ...target,
           name: newName,
           updated_at: nowIso,
         };
@@ -530,7 +628,7 @@ Deno.serve(async (req: Request) => {
             updated_at: nowIso,
             updated_by: admin.id,
           })
-          .eq("id", "default");
+          .eq("id", targetSettingsId);
 
         if (updateErr) return errorResponse("Failed to rename form: " + updateErr.message, 500);
 
@@ -547,14 +645,33 @@ Deno.serve(async (req: Request) => {
         const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
         if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
 
-        const { data: settingsRow, error: fetchErr } = await supabase
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse("Cryptographic signing key is not configured in Supabase Secrets.", 500);
+        }
+
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
           .from("agency_settings")
-          .select("meta_lead_forms")
-          .order("id", { ascending: true })
-          .limit(1)
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
           .maybeSingle();
 
-        if (fetchErr) return errorResponse("Failed to read agency settings: " + fetchErr.message, 500);
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
 
         const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
           ? settingsRow.meta_lead_forms
@@ -563,24 +680,38 @@ Deno.serve(async (req: Request) => {
         const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
         if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
 
-        const nowIso = new Date().toISOString();
-        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET") || "";
-
-        let newSig = existingForms[targetIdx].verification_sig || "";
-        if (hmacSecret) {
-          const payloadToSign = canonicalizeFormPayload({
-            id: existingForms[targetIdx].id,
-            meta_form_name: existingForms[targetIdx].meta_form_name || existingForms[targetIdx].name,
-            status: "inactive",
-            verified_at: existingForms[targetIdx].verified_at || nowIso,
-            verified_by: admin.id,
-            verified_page_id: existingForms[targetIdx].verified_page_id || TAHA_PAGE_ID,
+        const target = existingForms[targetIdx];
+        if (target.verification_sig) {
+          const existingCanonical = canonicalizeFormPayload({
+            id: target.id,
+            meta_form_name: target.meta_form_name || target.name,
+            status: target.status,
+            verified_at: target.verified_at,
+            verified_by: target.verified_by,
+            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
           });
-          newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+          const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+          if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+            return errorResponse(
+              "Cannot deactivate form: Form record failed cryptographic integrity check.",
+              403
+            );
+          }
         }
 
+        const nowIso = new Date().toISOString();
+        const payloadToSign = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: target.meta_form_name || target.name,
+          status: "inactive",
+          verified_at: target.verified_at || nowIso,
+          verified_by: admin.id,
+          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+        });
+        const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+
         const updatedRecord: VerifiedMetaLeadForm = {
-          ...existingForms[targetIdx],
+          ...target,
           status: "inactive",
           verification_sig: newSig,
           updated_at: nowIso,
@@ -596,7 +727,16 @@ Deno.serve(async (req: Request) => {
             updated_at: nowIso,
             updated_by: admin.id,
           })
-          .eq("id", "default");
+          .eq("id", targetSettingsId);
+
+        if (updateErr) return errorResponse("Failed to deactivate form: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form '${existingForms[targetIdx].name}' deactivated and removed from active list.`,
+          forms: updatedList,
+        });
+      }
 
         if (updateErr) return errorResponse("Failed to deactivate form: " + updateErr.message, 500);
 

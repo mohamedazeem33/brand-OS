@@ -2953,10 +2953,40 @@ function SettingsPage({
   };
 
   const handleToggleFormStatus = async (formItem: MetaLeadForm) => {
-    const nextStatus = formItem.status === 'active' ? 'inactive' : 'active';
     setFormActionInProgress(formItem.id);
     setFormFeedback(null);
     try {
+      // If form is unverified or missing cryptographic signature, route to verify_and_register_meta_form
+      if (!formItem.verification_sig) {
+        const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+          body: {
+            action: 'verify_and_register_meta_form',
+            form_id: formItem.id,
+            custom_name: formItem.name,
+          },
+        });
+
+        if (fnError || !data?.success) {
+          setFormFeedback({
+            type: 'error',
+            message: data?.error || fnError?.message || 'Failed to verify and sign form with Meta.',
+          });
+          return;
+        }
+
+        setFormFeedback({
+          type: 'success',
+          message: data.message || 'Form verified with Meta and sealed successfully.',
+        });
+        if (data.forms && settings) {
+          setSettings({ ...settings, meta_lead_forms: data.forms });
+        } else {
+          await loadSettings();
+        }
+        return;
+      }
+
+      const nextStatus = formItem.status === 'active' ? 'inactive' : 'active';
       const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
         body: {
           action: 'set_meta_form_status',
@@ -3416,7 +3446,8 @@ function SettingsPage({
                   <div className="meta-forms-list" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                     {settings.meta_lead_forms.map((formItem) => {
                       const isEditing = editingFormId === formItem.id;
-                      const isActive = formItem.status === 'active';
+                      const isSigned = !!(formItem.verification_sig && formItem.verification_sig.trim());
+                      const isActive = formItem.status === 'active' && isSigned;
                       const isBusy = formActionInProgress === formItem.id;
 
                       return (
@@ -3473,9 +3504,15 @@ function SettingsPage({
                           </div>
 
                           <div className="meta-form-actions" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <span className={`system-status-pill ${isActive ? 'verified' : 'unverified'}`}>
-                              {isActive ? 'Active' : 'Inactive'}
-                            </span>
+                            {!isSigned ? (
+                              <span className="system-status-pill unverified" title="Missing cryptographic verification signature. Must be verified with Meta to activate.">
+                                Unverified
+                              </span>
+                            ) : (
+                              <span className={`system-status-pill ${isActive ? 'verified' : 'unverified'}`}>
+                                {isActive ? 'Active' : 'Inactive'}
+                              </span>
+                            )}
 
                             <button
                               type="button"
@@ -3483,9 +3520,9 @@ function SettingsPage({
                               style={{ fontSize: 11, padding: '4px 10px', minHeight: 28 }}
                               disabled={isBusy}
                               onClick={() => handleToggleFormStatus(formItem)}
-                              title={isActive ? 'Deactivate form' : 'Activate form'}
+                              title={!isSigned ? 'Verify and sign form with Meta' : (isActive ? 'Deactivate form' : 'Activate form')}
                             >
-                              {isActive ? 'Deactivate' : 'Activate'}
+                              {!isSigned ? 'Verify' : (isActive ? 'Deactivate' : 'Activate')}
                             </button>
 
                             {!isEditing && (

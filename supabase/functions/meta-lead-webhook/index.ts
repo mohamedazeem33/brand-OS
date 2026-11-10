@@ -274,15 +274,28 @@ Deno.serve(async (req: Request) => {
     const supabase = adminClient();
 
     // 6. Whitelist & Canonical HMAC Verification (Executed BEFORE duplicate check and salesperson assignment)
-    const { data: settingsRow, error: settingsErr } = await supabase
+    // Target the singleton "default" agency_settings row explicitly, with fallback to first row
+    let settingsRow: any = null;
+    const { data: defaultRow, error: defaultErr } = await supabase
       .from("agency_settings")
       .select("meta_lead_forms")
-      .order("id", { ascending: true })
-      .limit(1)
+      .eq("id", "default")
       .maybeSingle();
 
-    if (settingsErr) {
-      console.error("Warning: Error fetching agency_settings:", settingsErr);
+    if (!defaultErr && defaultRow) {
+      settingsRow = defaultRow;
+    } else {
+      const { data: fallbackRow, error: fallbackErr } = await supabase
+        .from("agency_settings")
+        .select("meta_lead_forms")
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (fallbackErr) {
+        console.error("Warning: Error fetching agency_settings fallback:", fallbackErr);
+      }
+      settingsRow = fallbackRow;
     }
 
     const approvedForms: any[] = Array.isArray(settingsRow?.meta_lead_forms) ? settingsRow.meta_lead_forms : [];
@@ -298,17 +311,6 @@ Deno.serve(async (req: Request) => {
       }, 200);
     }
 
-    // Check if form is explicitly deactivated
-    if (matchedForm.status === "inactive") {
-      console.warn(`[meta-lead-webhook] Discarded lead from deactivated form ID '${incomingFormId}' (${matchedForm.name})`);
-      return json({
-        success: true,
-        ignored: true,
-        reason: "inactive_form",
-        message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is currently deactivated.`,
-      }, 200);
-    }
-
     // Defense-in-depth: Verify Page ID attribution stored in registry
     if (matchedForm.verified_page_id && matchedForm.verified_page_id !== TAHA_PAGE_ID) {
       console.warn(`[meta-lead-webhook] Discarded lead: Form '${incomingFormId}' attributed to foreign Page '${matchedForm.verified_page_id}'`);
@@ -320,35 +322,57 @@ Deno.serve(async (req: Request) => {
       }, 200);
     }
 
-    // Verify HMAC signature if record has verification_sig or if HMAC secret is configured
-    const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET");
-    if (hmacSecret && matchedForm.verification_sig) {
-      const canonicalPayload = canonicalizeFormPayload({
-        id: matchedForm.id,
-        meta_form_name: matchedForm.meta_form_name || matchedForm.name,
-        status: matchedForm.status,
-        verified_at: matchedForm.verified_at,
-        verified_by: matchedForm.verified_by,
-        verified_page_id: matchedForm.verified_page_id || TAHA_PAGE_ID,
-      });
-      const expectedSig = await computeFormRegistryHmac(canonicalPayload, hmacSecret);
-      if (!secureCompare(matchedForm.verification_sig, expectedSig)) {
-        console.error(`[meta-lead-webhook] SECURITY ALERT: Form '${incomingFormId}' failed canonical HMAC verification. Possible database tampering or unauthorized status modification.`);
-        return json({
-          success: true,
-          ignored: true,
-          reason: "tampered_or_unverified_form_record",
-          message: `Lead ignored: Form '${incomingFormId}' failed cryptographic verification check.`,
-        }, 200);
-      }
+    // MANDATORY HMAC VERIFICATION: Fail closed if HMAC secret is unconfigured
+    const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+    if (!hmacSecret) {
+      console.error("[meta-lead-webhook] CRITICAL: META_FORM_REGISTRY_HMAC_SECRET is not configured. Webhook rejecting lead (fail closed).");
+      return json({
+        success: true,
+        ignored: true,
+        reason: "registry_verification_unavailable",
+        message: "Lead ignored: Cryptographic form registry verification is not configured.",
+      }, 200);
     }
 
+    // MANDATORY REGISTRY SIGNATURE: Form MUST have a non-empty verification_sig
+    if (!matchedForm.verification_sig || typeof matchedForm.verification_sig !== "string" || !matchedForm.verification_sig.trim()) {
+      console.error(`[meta-lead-webhook] SECURITY ALERT: Form '${incomingFormId}' has no cryptographic signature in registry.`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "tampered_or_unverified_form_record",
+        message: `Lead ignored: Form '${incomingFormId}' is unsigned or unverified.`,
+      }, 200);
+    }
+
+    // Verify HMAC signature against canonical payload
+    const canonicalPayload = canonicalizeFormPayload({
+      id: matchedForm.id,
+      meta_form_name: matchedForm.meta_form_name || matchedForm.name,
+      status: matchedForm.status,
+      verified_at: matchedForm.verified_at,
+      verified_by: matchedForm.verified_by,
+      verified_page_id: matchedForm.verified_page_id || TAHA_PAGE_ID,
+    });
+    const expectedSig = await computeFormRegistryHmac(canonicalPayload, hmacSecret);
+    if (!secureCompare(matchedForm.verification_sig.trim(), expectedSig)) {
+      console.error(`[meta-lead-webhook] SECURITY ALERT: Form '${incomingFormId}' failed canonical HMAC verification. Possible database tampering or unauthorized status modification.`);
+      return json({
+        success: true,
+        ignored: true,
+        reason: "tampered_or_unverified_form_record",
+        message: `Lead ignored: Form '${incomingFormId}' failed cryptographic verification check.`,
+      }, 200);
+    }
+
+    // Form status must be active (HMAC verified)
     if (matchedForm.status !== "active") {
+      console.warn(`[meta-lead-webhook] Discarded lead from deactivated form ID '${incomingFormId}' (${matchedForm.name})`);
       return json({
         success: true,
         ignored: true,
         reason: "inactive_form",
-        message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is not active.`,
+        message: `Lead ignored: Form '${matchedForm.name}' (${incomingFormId}) is currently deactivated.`,
       }, 200);
     }
 

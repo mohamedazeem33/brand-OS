@@ -270,7 +270,7 @@ function parseMetaInstantFormUrl(input) {
 console.log("PASS: Meta Instant Form URL validation and ID extraction (valid, invalid, query params, path)");
 
 // 8. Strict Approved Forms Validation & Pipeline Protection
-function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms) {
+function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms, hmacSecret = "default-test-hmac-secret") {
   const TAHA_PAGE_ID = "104523992487431";
   const FORM_ID_REGEX = /^\d{14,18}$/;
 
@@ -304,14 +304,6 @@ function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms)
     };
   }
 
-  if (matched.status === "inactive") {
-    return {
-      allowed: false,
-      reason: "inactive_form",
-      message: `Lead ignored: Form '${matched.name}' (${cleanFormId}) is currently deactivated.`,
-    };
-  }
-
   if (matched.verified_page_id && matched.verified_page_id !== TAHA_PAGE_ID) {
     return {
       allowed: false,
@@ -320,17 +312,44 @@ function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms)
     };
   }
 
+  // Mandatory HMAC Secret check
+  if (!hmacSecret || !hmacSecret.trim()) {
+    return {
+      allowed: false,
+      reason: "registry_verification_unavailable",
+      message: "Lead ignored: Cryptographic form registry verification is not configured.",
+    };
+  }
+
+  // Mandatory Signature check
+  if (!matched.verification_sig || !matched.verification_sig.trim()) {
+    return {
+      allowed: false,
+      reason: "tampered_or_unverified_form_record",
+      message: `Lead ignored: Form '${cleanFormId}' is unsigned or unverified.`,
+    };
+  }
+
+  if (matched.status === "inactive") {
+    return {
+      allowed: false,
+      reason: "inactive_form",
+      message: `Lead ignored: Form '${matched.name}' (${cleanFormId}) is currently deactivated.`,
+    };
+  }
+
   return { allowed: true, reason: null, matchedForm: matched };
 }
 
 {
   const mockApprovedForms = [
-    { id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active", verified_page_id: "104523992487431" },
-    { id: "2222333344445555", name: "Old Performance Campaign", status: "inactive", verified_page_id: "104523992487431" },
-    { id: "3333444455556666", name: "Foreign Page Form", status: "active", verified_page_id: "999999999999999" },
+    { id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active", verified_page_id: "104523992487431", verification_sig: "mock-valid-sig-1234" },
+    { id: "2222333344445555", name: "Old Performance Campaign", status: "inactive", verified_page_id: "104523992487431", verification_sig: "mock-valid-sig-5678" },
+    { id: "3333444455556666", name: "Foreign Page Form", status: "active", verified_page_id: "999999999999999", verification_sig: "mock-valid-sig-9999" },
+    { id: "4444555566667777", name: "Unsigned Record", status: "active", verified_page_id: "104523992487431", verification_sig: "" },
   ];
 
-  // Active approved form with correct page_id is accepted
+  // Active approved form with correct page_id and signature is accepted
   const checkActive = validateApprovedLeadForm("1650833669757581", "104523992487431", mockApprovedForms);
   assert.equal(checkActive.allowed, true);
   assert.equal(checkActive.matchedForm?.name, "Taha Media - Client Enquiry Form");
@@ -344,6 +363,16 @@ function validateApprovedLeadForm(incomingFormId, incomingPageId, approvedForms)
   const checkUnapproved = validateApprovedLeadForm("9999888877776666", "104523992487431", mockApprovedForms);
   assert.equal(checkUnapproved.allowed, false);
   assert.equal(checkUnapproved.reason, "unapproved_form");
+
+  // Unsigned form is rejected
+  const checkUnsigned = validateApprovedLeadForm("4444555566667777", "104523992487431", mockApprovedForms);
+  assert.equal(checkUnsigned.allowed, false);
+  assert.equal(checkUnsigned.reason, "tampered_or_unverified_form_record");
+
+  // Missing HMAC Secret is rejected
+  const checkNoSecret = validateApprovedLeadForm("1650833669757581", "104523992487431", mockApprovedForms, "");
+  assert.equal(checkNoSecret.allowed, false);
+  assert.equal(checkNoSecret.reason, "registry_verification_unavailable");
 
   // Missing form ID is rejected (NEVER bypasses validation)
   const checkMissingFormId = validateApprovedLeadForm(null, "104523992487431", mockApprovedForms);
