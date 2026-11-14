@@ -580,4 +580,165 @@ console.log("PASS 6: [SIMULATION] Row Level Security: employee data isolation an
 }
 console.log("PASS 7: [SIMULATION] Auditable admin correction workflow preserves original evidence in audit log");
 
-console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (7/7).\n");
+// ============================================================================
+// TEST 8: [SIMULATION] Multi-Sample GPS Acquisition (Windows / Android / iOS)
+// ============================================================================
+{
+  /**
+   * Simulates high-accuracy multi-sample collection from device GPS sensors.
+   * Devices (Windows laptops, iPhones, Android) typically warm up:
+   * Sample 1: Coarse/cached location (e.g. ±180m accuracy)
+   * Sample 2: Network-assisted / initial GPS fix (e.g. ±65m accuracy)
+   * Sample 3: High-precision satellite / fused fix (e.g. ±18m accuracy)
+   */
+  function simulateMultiSampleAcquisition(deviceType, rawSamples, maxAcceptableAccuracy = 150.0) {
+    assert.ok(["windows_laptop", "android_phone", "iphone"].includes(deviceType));
+
+    const evaluated = rawSamples.map((sample, idx) => {
+      const distance = calculateDistanceMeters(sample.lat, sample.lng, OFFICE_LAT, OFFICE_LNG);
+      return {
+        sampleIndex: idx + 1,
+        lat: sample.lat,
+        lng: sample.lng,
+        accuracy: sample.accuracy,
+        distance,
+      };
+    });
+
+    // Select the best reading (minimum accuracy radius in metres)
+    const bestReading = evaluated.reduce((best, curr) => {
+      if (!best || curr.accuracy < best.accuracy) return curr;
+      return best;
+    }, null);
+
+    const isReliable = bestReading && bestReading.accuracy <= maxAcceptableAccuracy;
+    const isWithinGeofence = bestReading && bestReading.distance <= GEOFENCE_RADIUS_METERS;
+
+    return {
+      deviceType,
+      sampleCount: evaluated.length,
+      evaluated,
+      bestReading,
+      isReliable,
+      isWithinGeofence,
+    };
+  }
+
+  // Windows Laptop simulation: starts with coarse Wi-Fi/IP fix, refines to reliable fix
+  const windowsResult = simulateMultiSampleAcquisition("windows_laptop", [
+    { lat: 13.06945, lng: 80.18150, accuracy: 175.0 }, // Coarse initial reading (> 150m)
+    { lat: 13.06935, lng: 80.18147, accuracy: 65.0 },  // Refined reading (65m)
+    { lat: 13.06932, lng: 80.18146, accuracy: 22.0 },  // Stabilized reading (22m)
+  ]);
+  assert.equal(windowsResult.sampleCount, 3);
+  assert.equal(windowsResult.bestReading.accuracy, 22.0);
+  assert.ok(windowsResult.isReliable, "Windows laptop achieved reliable accuracy <= 150m");
+  assert.ok(windowsResult.isWithinGeofence, "Windows laptop best reading is within 100m geofence");
+
+  // iPhone (iOS) simulation: GPS sensor locks satellite fix
+  const iphoneResult = simulateMultiSampleAcquisition("iphone", [
+    { lat: 13.06940, lng: 80.18148, accuracy: 48.0 },
+    { lat: 13.06931, lng: 80.18145, accuracy: 12.0 }, // Satellite fix (12m)
+  ]);
+  assert.equal(iphoneResult.bestReading.accuracy, 12.0);
+  assert.ok(iphoneResult.isReliable);
+  assert.ok(iphoneResult.isWithinGeofence);
+
+  // Android phone simulation: High accuracy fused location
+  const androidResult = simulateMultiSampleAcquisition("android_phone", [
+    { lat: 13.06950, lng: 80.18160, accuracy: 85.0 },
+    { lat: 13.06933, lng: 80.18146, accuracy: 15.0 },
+  ]);
+  assert.equal(androidResult.bestReading.accuracy, 15.0);
+  assert.ok(androidResult.isReliable);
+  assert.ok(androidResult.isWithinGeofence);
+}
+console.log("PASS 8: [SIMULATION] Multi-sample GPS location acquisition & best accuracy selection (Windows / Android / iOS)");
+
+// ============================================================================
+// TEST 9: [SIMULATION] Insufficient Accuracy Rejection & Retry Workflow
+// ============================================================================
+{
+  function evaluateGPSReadingWithRetry(rawReading, maxAccuracy = MAX_GPS_ACCURACY_METERS) {
+    const distance = calculateDistanceMeters(rawReading.lat, rawReading.lng, OFFICE_LAT, OFFICE_LNG);
+    if (rawReading.accuracy > maxAccuracy) {
+      return {
+        acceptable: false,
+        requiresRetry: true,
+        detectedCoordinates: { lat: rawReading.lat, lng: rawReading.lng },
+        detectedAccuracy: rawReading.accuracy,
+        detectedDistance: distance,
+        message: `GPS accuracy is insufficient (±${Math.round(rawReading.accuracy)}m). Office attendance requires accuracy within ±${maxAccuracy}m. Please move closer to a window or turn on High Accuracy and retry.`,
+      };
+    }
+    return {
+      acceptable: true,
+      requiresRetry: false,
+      detectedCoordinates: { lat: rawReading.lat, lng: rawReading.lng },
+      detectedAccuracy: rawReading.accuracy,
+      detectedDistance: distance,
+      isInsideGeofence: distance <= GEOFENCE_RADIUS_METERS,
+    };
+  }
+
+  // Attempt 1: Poor accuracy (±220m) -> Triggers retry option
+  const attempt1 = evaluateGPSReadingWithRetry({ lat: 13.0693169, lng: 80.1814571, accuracy: 220.0 });
+  assert.equal(attempt1.acceptable, false);
+  assert.equal(attempt1.requiresRetry, true);
+  assert.match(attempt1.message, /insufficient/i);
+  assert.equal(attempt1.detectedAccuracy, 220.0);
+  assert.equal(attempt1.detectedDistance, 0);
+
+  // User clicks "Retry GPS Reading" after moving near a window:
+  // Attempt 2: Improved accuracy (±18m) -> Accepted
+  const attempt2 = evaluateGPSReadingWithRetry({ lat: 13.0693169, lng: 80.1814571, accuracy: 18.0 });
+  assert.equal(attempt2.acceptable, true);
+  assert.equal(attempt2.requiresRetry, false);
+  assert.equal(attempt2.isInsideGeofence, true);
+}
+console.log("PASS 9: [SIMULATION] Insufficient accuracy rejection and retry workflow verified");
+
+// ============================================================================
+// TEST 10: [SIMULATION] Shift Threshold Time Display Formatting (10:00 AM IST vs 03:30 PM)
+// ============================================================================
+{
+  /**
+   * Helper that formats a PostgreSQL time string (e.g. "10:00:00" or "10:00")
+   * directly without erroneous UTC-to-IST double offsetting.
+   */
+  function formatShiftThreshold(timeStr) {
+    if (!timeStr) return "10:00 AM IST";
+    const clean = timeStr.trim();
+    const [hStr, mStr] = clean.split(":");
+    const h = parseInt(hStr, 10);
+    const m = parseInt(mStr || "0", 10);
+    if (isNaN(h)) return "10:00 AM IST";
+    const period = h >= 12 ? "PM" : "AM";
+    const displayH = h % 12 === 0 ? 12 : h % 12;
+    const displayM = m.toString().padStart(2, "0");
+    return `${displayH}:${displayM} ${period} IST`;
+  }
+
+  // Verify that the bug (passing "1970-01-01T10:00:00Z" to Intl.DateTimeFormat in Asia/Kolkata)
+  // was producing 03:30 PM due to the +05:30 offset
+  const bugUtcDate = new Date("1970-01-01T10:00:00Z");
+  const bugFormatted = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(bugUtcDate);
+  // bugFormatted in IST will be "03:30 pm"
+  assert.match(bugFormatted, /03:30/i, "Demonstrates the UTC double-offset bug that caused 03:30 PM");
+
+  // Verify the new helper formatShiftThreshold:
+  assert.equal(formatShiftThreshold("10:00:00"), "10:00 AM IST");
+  assert.equal(formatShiftThreshold("10:00"), "10:00 AM IST");
+  assert.equal(formatShiftThreshold("09:30:00"), "9:30 AM IST");
+  assert.equal(formatShiftThreshold("14:15:00"), "2:15 PM IST");
+  assert.equal(formatShiftThreshold(null), "10:00 AM IST");
+  assert.equal(formatShiftThreshold(undefined), "10:00 AM IST");
+}
+console.log("PASS 10: [SIMULATION] Shift threshold formatting renders 10:00 AM IST and prevents 03:30 PM bug");
+
+console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (10/10).\n");

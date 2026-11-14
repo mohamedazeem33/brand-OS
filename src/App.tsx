@@ -795,12 +795,69 @@ function calculateWorkDuration(checkIn: string | null | undefined, checkOut: str
   return `${hours}h ${mins}m`;
 }
 
+function formatShiftThreshold(timeStr: string | null | undefined): string {
+  if (!timeStr) return '10:00 AM IST';
+  const clean = timeStr.trim();
+  const [hStr, mStr] = clean.split(':');
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr || '0', 10);
+  if (isNaN(h)) return '10:00 AM IST';
+  const period = h >= 12 ? 'PM' : 'AM';
+  const displayH = h % 12 === 0 ? 12 : h % 12;
+  const displayM = m.toString().padStart(2, '0');
+  return `${displayH}:${displayM} ${period} IST`;
+}
+
+function calculateClientDistanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return 0;
+  const r = 6371000;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(Math.min(1, a)), Math.sqrt(Math.max(0, 1 - a)));
+  return Math.round(r * c * 10) / 10;
+}
+
+interface GPSFix {
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  distanceMeters: number;
+  timestamp: number;
+}
+
+type GPSState = {
+  active: boolean;
+  action: 'check_in' | 'check_out';
+  phase: 'idle' | 'acquiring' | 'submitting' | 'insufficient' | 'rejected' | 'error';
+  sampleCount: number;
+  currentFix: GPSFix | null;
+  bestFix: GPSFix | null;
+  errorMessage?: string;
+};
+
 function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
   const [record, setRecord] = useState<AttendanceRecord | null>(null);
   const [settings, setSettings] = useState<AttendanceSettings | null>(null);
   const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+
+  const [gpsState, setGpsState] = useState<GPSState>({
+    active: false,
+    action: 'check_in',
+    phase: 'idle',
+    sampleCount: 0,
+    currentFix: null,
+    bestFix: null,
+  });
+
+  const watchIdRef = useRef<number | null>(null);
+  const timeoutRef = useRef<any>(null);
+  const samplesRef = useRef<GPSFix[]>([]);
+  const isSubmittingRef = useRef<boolean>(false);
 
   const todayStr = useMemo(() => getTodayDateString(), []);
 
@@ -831,78 +888,206 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
     loadAttendance();
   }, [profile.id, todayStr]);
 
-  const handleAction = (action: 'check_in' | 'check_out') => {
+  const stopGPSWatch = () => {
+    if (watchIdRef.current != null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      stopGPSWatch();
+    };
+  }, []);
+
+  const cancelGPSFlow = () => {
+    stopGPSWatch();
+    isSubmittingRef.current = false;
+    setGpsState((prev) => ({
+      ...prev,
+      active: false,
+      phase: 'idle',
+    }));
+  };
+
+  const submitAttendanceFix = async (action: 'check_in' | 'check_out', fix: GPSFix) => {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    setGpsState((prev) => ({ ...prev, phase: 'submitting', bestFix: fix }));
+
+    try {
+      const rpcName = action === 'check_in' ? 'record_attendance_check_in' : 'record_attendance_check_out';
+      const { data, error } = await supabase.rpc(rpcName, {
+        p_latitude: fix.latitude,
+        p_longitude: fix.longitude,
+        p_accuracy: fix.accuracy,
+      });
+
+      if (error) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'rejected',
+          errorMessage: error.message || `Failed to record ${action.replace('_', ' ')}.`,
+        }));
+        return;
+      }
+
+      if (data?.record) {
+        setRecord(data.record);
+        setMessage({ type: 'success', text: data.message || `Successfully recorded ${action.replace('_', ' ')}!` });
+      } else {
+        await loadAttendance();
+        setMessage({ type: 'success', text: `Attendance updated successfully.` });
+      }
+
+      setGpsState((prev) => ({ ...prev, active: false, phase: 'idle' }));
+    } catch (err: any) {
+      setGpsState((prev) => ({
+        ...prev,
+        phase: 'rejected',
+        errorMessage: err.message || 'Server error recording attendance.',
+      }));
+    } finally {
+      isSubmittingRef.current = false;
+    }
+  };
+
+  const startGPSFlow = (action: 'check_in' | 'check_out') => {
     setMessage(null);
+    stopGPSWatch();
+    isSubmittingRef.current = false;
+    samplesRef.current = [];
+
     if (!navigator.geolocation) {
       setMessage({ type: 'error', text: 'Geolocation is not supported by your browser.' });
       return;
     }
 
-    setActionLoading(true);
-    setMessage({
-      type: 'info',
-      text: 'Acquiring GPS location... Please allow browser location access when prompted.',
+    const officeLat = Number(settings?.office_lat) || 13.0693169;
+    const officeLng = Number(settings?.office_lng) || 80.1814571;
+    const maxAccuracy = Number(settings?.max_gps_accuracy_meters) || 150.0;
+
+    setGpsState({
+      active: true,
+      action,
+      phase: 'acquiring',
+      sampleCount: 0,
+      currentFix: null,
+      bestFix: null,
+      errorMessage: undefined,
     });
 
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude, longitude, accuracy } = pos.coords;
-        try {
-          const rpcName = action === 'check_in' ? 'record_attendance_check_in' : 'record_attendance_check_out';
-          const { data, error } = await supabase.rpc(rpcName, {
-            p_latitude: latitude,
-            p_longitude: longitude,
-            p_accuracy: accuracy,
-          });
-
-          if (error) {
-            setMessage({ type: 'error', text: error.message || `Failed to record ${action.replace('_', ' ')}.` });
-            return;
-          }
-
-          if (data?.record) {
-            setRecord(data.record);
-            setMessage({ type: 'success', text: data.message || `Successfully recorded ${action.replace('_', ' ')}!` });
-          } else {
-            await loadAttendance();
-            setMessage({ type: 'success', text: `Attendance updated successfully.` });
-          }
-        } catch (rpcErr: any) {
-          setMessage({ type: 'error', text: rpcErr.message || 'Server error recording attendance.' });
-        } finally {
-          setActionLoading(false);
-        }
-      },
-      (geoError) => {
-        setActionLoading(false);
-        if (geoError.code === 1) {
-          setMessage({
-            type: 'error',
-            text: 'Location permission was denied. Please allow location access in your browser settings to verify your attendance within the office geofence.',
-          });
-        } else if (geoError.code === 2) {
-          setMessage({
-            type: 'error',
-            text: 'GPS position unavailable. Please ensure your device location is enabled and try again.',
-          });
-        } else if (geoError.code === 3) {
-          setMessage({
-            type: 'error',
-            text: 'Location request timed out. Please try again with clear GPS signal.',
-          });
-        } else {
-          setMessage({
-            type: 'error',
-            text: 'GPS error: ' + (geoError.message || 'Could not acquire location.'),
-          });
-        }
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0,
+    const evaluateSamples = (samples: GPSFix[]) => {
+      stopGPSWatch();
+      if (samples.length === 0) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'error',
+          errorMessage: 'Could not obtain a GPS fix from your device. Please ensure location services are enabled and try again.',
+        }));
+        return;
       }
-    );
+
+      // Pick reading with lowest accuracy radius in metres
+      const best = samples.reduce((b, s) => (!b || s.accuracy < b.accuracy ? s : b), samples[0]);
+
+      if (best.accuracy > maxAccuracy) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'insufficient',
+          bestFix: best,
+          errorMessage: `GPS accuracy (±${Math.round(best.accuracy)}m) is insufficient. Office attendance requires accuracy within ±${Math.round(maxAccuracy)}m.`,
+        }));
+        return;
+      }
+
+      // Reliable reading: proceed to authoritative backend verification
+      submitAttendanceFix(action, best);
+    };
+
+    // Safety timeout: settle after 7 seconds of sampling
+    timeoutRef.current = setTimeout(() => {
+      if (samplesRef.current.length > 0) {
+        evaluateSamples(samplesRef.current);
+      } else {
+        stopGPSWatch();
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'error',
+          errorMessage: 'GPS request timed out waiting for a fix. Please try again with a clearer view of the sky or near an open window.',
+        }));
+      }
+    }, 7000);
+
+    try {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          const acc = pos.coords.accuracy;
+          const dist = calculateClientDistanceMeters(lat, lng, officeLat, officeLng);
+
+          const fix: GPSFix = {
+            latitude: lat,
+            longitude: lng,
+            accuracy: acc,
+            distanceMeters: dist,
+            timestamp: pos.timestamp || Date.now(),
+          };
+
+          samplesRef.current.push(fix);
+          const currentCount = samplesRef.current.length;
+          const currentBest = samplesRef.current.reduce((b, s) => (!b || s.accuracy < b.accuracy ? s : b), fix);
+
+          setGpsState((prev) => ({
+            ...prev,
+            sampleCount: currentCount,
+            currentFix: fix,
+            bestFix: currentBest,
+          }));
+
+          // Fast-path: if accuracy is <= 25m (satellite lock) and we have >= 2 readings, settle immediately
+          if (fix.accuracy <= 25 && currentCount >= 2) {
+            evaluateSamples(samplesRef.current);
+          } else if (currentCount >= 4) {
+            evaluateSamples(samplesRef.current);
+          }
+        },
+        (err) => {
+          stopGPSWatch();
+          let msg = 'Could not acquire GPS position.';
+          if (err.code === 1) {
+            msg = 'Location permission was denied. Please allow location access in your browser settings to verify your attendance within the office geofence.';
+          } else if (err.code === 2) {
+            msg = 'GPS position unavailable. Please ensure your device location is enabled and try again.';
+          } else if (err.code === 3) {
+            msg = 'GPS request timed out. Please click Retry GPS Reading with clear reception.';
+          }
+          setGpsState((prev) => ({
+            ...prev,
+            phase: 'error',
+            errorMessage: msg,
+          }));
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 0,
+        }
+      );
+    } catch (e: any) {
+      stopGPSWatch();
+      setGpsState((prev) => ({
+        ...prev,
+        phase: 'error',
+        errorMessage: e.message || 'Error initializing browser geolocation.',
+      }));
+    }
   };
 
   const isCheckedIn = !!record?.check_in_time;
@@ -924,7 +1109,7 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
 
         <div style={{ textAlign: 'right' }}>
           <span style={{ font: "11px 'DM Mono', monospace", color: '#77796f', textTransform: 'uppercase' }}>
-            Shift Threshold: {settings?.late_threshold_time ? formatAttendanceTime(`1970-01-01T${settings.late_threshold_time}Z`) : '10:00 AM IST'}
+            Shift Threshold: {formatShiftThreshold(settings?.late_threshold_time)}
           </span>
         </div>
       </div>
@@ -969,7 +1154,7 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
               <>
                 <strong>Not Checked In Today</strong>
                 <span>
-                  Attendance must be marked within 100 metres of the registered office. Device location will only be captured when you click Check In.
+                  Attendance must be marked within 100 metres of the registered office. High-accuracy GPS will only be captured when you click Check In.
                 </span>
               </>
             )}
@@ -980,8 +1165,8 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
           <button
             type="button"
             className="attendance-btn-checkin"
-            disabled={loading || actionLoading || isCheckedIn}
-            onClick={() => handleAction('check_in')}
+            disabled={loading || gpsState.active || isCheckedIn}
+            onClick={() => startGPSFlow('check_in')}
             title={isCheckedIn ? 'You have already checked in today' : 'Record check-in within office radius'}
           >
             <Crosshair size={16} />
@@ -991,8 +1176,8 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
           <button
             type="button"
             className="attendance-btn-checkout"
-            disabled={loading || actionLoading || !isCheckedIn || isCheckedOut}
-            onClick={() => handleAction('check_out')}
+            disabled={loading || gpsState.active || !isCheckedIn || isCheckedOut}
+            onClick={() => startGPSFlow('check_out')}
             title={
               !isCheckedIn
                 ? 'Check in is required before checking out'
@@ -1006,6 +1191,113 @@ function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
           </button>
         </div>
       </div>
+
+      {/* Live GPS Telemetry Panel during acquisition & error / retry */}
+      {gpsState.active && (
+        <div className={`gps-telemetry-panel ${gpsState.phase}`}>
+          <div className="gps-telemetry-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Crosshair size={16} className={gpsState.phase === 'acquiring' ? 'spin' : ''} style={{ color: '#386342' }} />
+              <strong style={{ fontSize: 13, color: '#272a24' }}>
+                {gpsState.action === 'check_in' ? 'Check In' : 'Check Out'} — GPS Location Verification
+              </strong>
+            </div>
+            <span className={`gps-phase-pill ${gpsState.phase}`}>
+              {gpsState.phase === 'acquiring' && `Sampling GPS (${gpsState.sampleCount}/4)...`}
+              {gpsState.phase === 'submitting' && 'Verifying with Server...'}
+              {gpsState.phase === 'insufficient' && 'Accuracy Insufficient'}
+              {gpsState.phase === 'rejected' && 'Server Rejected'}
+              {gpsState.phase === 'error' && 'Sensor Error'}
+            </span>
+          </div>
+
+          <div className="gps-telemetry-grid">
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Detected Coordinates</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? `${(gpsState.bestFix || gpsState.currentFix)!.latitude.toFixed(6)}, ${(gpsState.bestFix || gpsState.currentFix)!.longitude.toFixed(6)}`
+                  : 'Acquiring satellite fix...'}
+              </strong>
+              <small className="gps-telemetry-sub">Hardware / Browser GPS</small>
+            </div>
+
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Reported Accuracy</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? `±${Math.round((gpsState.bestFix || gpsState.currentFix)!.accuracy)} m`
+                  : '—'}
+              </strong>
+              <small className="gps-telemetry-sub">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? (gpsState.bestFix || gpsState.currentFix)!.accuracy <= 30
+                    ? 'High Precision'
+                    : (gpsState.bestFix || gpsState.currentFix)!.accuracy <= (Number(settings?.max_gps_accuracy_meters) || 150)
+                    ? 'Acceptable (≤150m)'
+                    : 'Poor (>150m threshold)'
+                  : 'Max allowed: ±150m'}
+              </small>
+            </div>
+
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Distance from Office</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? formatDistanceMeters((gpsState.bestFix || gpsState.currentFix)!.distanceMeters)
+                  : '—'}
+              </strong>
+              <small className="gps-telemetry-sub">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? (gpsState.bestFix || gpsState.currentFix)!.distanceMeters <= (Number(settings?.geofence_radius_meters) || 100)
+                    ? 'Inside 100m Geofence'
+                    : `Outside Geofence (${Math.round((gpsState.bestFix || gpsState.currentFix)!.distanceMeters)}m > 100m)`
+                  : 'Geofence limit: 100m'}
+              </small>
+            </div>
+          </div>
+
+          {gpsState.errorMessage && (
+            <div className="gps-telemetry-alert error">
+              <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+              <div>{gpsState.errorMessage}</div>
+            </div>
+          )}
+
+          {(gpsState.phase === 'insufficient' || gpsState.phase === 'error') && (
+            <div className="gps-troubleshooting-card">
+              <p style={{ fontWeight: 600, fontSize: 12, margin: '0 0 6px 0', color: '#272a24' }}>
+                Device Location Guidance (Windows / Android / iPhone):
+              </p>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 11, color: '#57534e', lineHeight: 1.6 }}>
+                <li><strong>Windows Laptops:</strong> In <em>Settings &gt; Privacy &amp; security &gt; Location</em>, ensure Location Services are ON. Moving closer to an open window enhances accuracy.</li>
+                <li><strong>iPhones (iOS Safari / Chrome):</strong> In <em>Settings &gt; Safari (or Chrome) &gt; Location</em>, verify that <strong>Precise Location</strong> is toggled <strong>ON</strong>.</li>
+                <li><strong>Android Phones:</strong> Enable <strong>Google Location Accuracy</strong> in <em>Settings &gt; Location</em> for optimal satellite lock.</li>
+              </ul>
+            </div>
+          )}
+
+          <div className="gps-telemetry-actions">
+            {(gpsState.phase === 'insufficient' || gpsState.phase === 'rejected' || gpsState.phase === 'error') && (
+              <button
+                type="button"
+                className="gps-btn-retry"
+                onClick={() => startGPSFlow(gpsState.action)}
+              >
+                <RotateCcw size={14} />
+                Retry GPS Reading
+              </button>
+            )}
+            <button
+              type="button"
+              className="gps-btn-cancel"
+              onClick={cancelGPSFlow}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {message && (
         <div className={`attendance-alert ${message.type}`}>
@@ -3179,7 +3471,7 @@ function AttendanceAdminPage({
             <CheckCircle2 size={16} style={{ color: '#43724e' }} />
           </div>
           <strong style={{ color: '#386342' }}>{metrics.onTimeCount}</strong>
-          <small>Before threshold ({settings?.late_threshold_time?.slice(0, 5) || '10:00'})</small>
+          <small>Before threshold ({formatShiftThreshold(settings?.late_threshold_time)})</small>
         </div>
 
         <div className="admin-attendance-metric">
@@ -3188,7 +3480,7 @@ function AttendanceAdminPage({
             <Clock3 size={16} style={{ color: '#986a30' }} />
           </div>
           <strong style={{ color: '#986a30' }}>{metrics.lateCount}</strong>
-          <small>After threshold</small>
+          <small>After threshold ({formatShiftThreshold(settings?.late_threshold_time)})</small>
         </div>
 
         <div className="admin-attendance-metric">
@@ -3591,7 +3883,7 @@ function AttendanceCorrectionModal({
               <input
                 type="text"
                 disabled
-                value={settings?.late_threshold_time ? `${settings.late_threshold_time.slice(0, 5)} IST` : '10:00 IST'}
+                value={formatShiftThreshold(settings?.late_threshold_time)}
                 style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#f5f5f4', fontSize: 13, color: '#78716c' }}
               />
             </div>
