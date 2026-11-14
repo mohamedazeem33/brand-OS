@@ -16,7 +16,9 @@ import {
   Clock,
   Clock3,
   Copy,
+  Crosshair,
   Edit2,
+  ExternalLink,
   Eye,
   EyeOff,
   FileText,
@@ -27,6 +29,7 @@ import {
   Lock,
   LogOut,
   Mail,
+  MapPin,
   Menu,
   MoreHorizontal,
   Phone,
@@ -118,7 +121,7 @@ type Client = {
   updated_at: string;
 };
 
-type Page = 'dashboard' | 'leads' | 'clients' | 'finance' | 'team' | 'settings' | 'deleted_leads' | 'unqualified_leads';
+type Page = 'dashboard' | 'leads' | 'clients' | 'attendance' | 'finance' | 'team' | 'settings' | 'deleted_leads' | 'unqualified_leads';
 type LeadQuickFilter = 'all' | 'today' | 'active' | 'follow_ups' | 'converted';
 type LeadForm = Omit<Lead, 'id' | 'created_at' | 'updated_at' | 'received_at' | 'meta_lead_id' | 'deleted_at' | 'deleted_by' | 'next_follow_up_at' | 'qualification_status' | 'unqualified_reason' | 'unqualified_notes' | 'unqualified_at' | 'unqualified_by'>;
 type ClientForm = Omit<Client, 'id' | 'created_by' | 'created_at' | 'updated_at' | 'lead_id'>;
@@ -144,6 +147,7 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard; adminOn
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'leads', label: 'Leads', icon: Target },
   { id: 'clients', label: 'Clients', icon: UsersRound },
+  { id: 'attendance', label: 'Attendance', icon: UserCheck, adminOnly: true },
   { id: 'unqualified_leads', label: 'Unqualified', icon: Ban, adminOnly: true },
   { id: 'deleted_leads', label: 'Deleted leads', icon: Trash2, adminOnly: true },
   { id: 'finance', label: 'Finance', icon: Tag, adminOnly: true },
@@ -413,7 +417,7 @@ function Workspace({
   const isAdmin = profile.role === 'admin';
   const allowedPages = useMemo<Page[]>(() => (
     isAdmin
-      ? ['dashboard', 'leads', 'clients', 'unqualified_leads', 'deleted_leads', 'finance', 'team', 'settings']
+      ? ['dashboard', 'leads', 'clients', 'attendance', 'unqualified_leads', 'deleted_leads', 'finance', 'team', 'settings']
       : ['dashboard', 'leads', 'clients']
   ), [isAdmin]);
 
@@ -668,6 +672,7 @@ function Workspace({
       {page === 'dashboard' && <Dashboard leads={activeLeads} profiles={profiles} clients={clients} profile={profile} onOpenLeads={() => handleNavigateToLeads('all')} onOpenClients={() => handleNavigate('clients')} onAdd={() => setShowAdd(true)} onOpenConverted={() => setShowConverted(true)} onOpenClient={(c) => setSelectedClient(c)} onNavigateFilteredLeads={handleNavigateToLeads} />}
       {page === 'leads' && <LeadsPage leads={activeLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAdd(true)} onSelect={setSelectedLead} quickFilter={leadQuickFilter} onQuickFilterChange={setLeadQuickFilter} deletedCount={deletedLeads.length} unqualifiedCount={unqualifiedLeads.length} onOpenDeleted={() => handleNavigate('deleted_leads')} onOpenUnqualified={() => handleNavigate('unqualified_leads')} onOpenConverted={() => setShowConverted(true)} />}
       {page === 'clients' && <ClientsPage clients={clients} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAddClient(true)} onSelect={setSelectedClient} />}
+      {isAdmin && page === 'attendance' && <AttendanceAdminPage profile={profile} profiles={profiles} />}
       {isAdmin && page === 'unqualified_leads' && <UnqualifiedLeadsPage leads={unqualifiedLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onSelect={setSelectedLead} />}
       {isAdmin && page === 'deleted_leads' && <DeletedLeadsPage leads={deletedLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onRestore={restoreLead} />}
       {isAdmin && page === 'team' && <TeamPage profile={profile} />}
@@ -699,6 +704,326 @@ function Workspace({
     {selectedClient && <ClientDetail client={selectedClient} profiles={profiles} profile={profile} onClose={() => setSelectedClient(null)} onSave={(form) => saveClient(form, selectedClient.id)} />}
     {showConverted && <ConvertedLeadsView leads={activeLeads.filter((l) => l.status === 'converted')} clients={clients} profiles={profiles} onClose={() => setShowConverted(false)} onOpenClient={(c) => { setShowConverted(false); setSelectedClient(c); }} />}
   </div>;
+}
+
+// ============================================================================
+// OFFICE GPS ATTENDANCE TYPES & HELPERS
+// ============================================================================
+
+type AttendanceSettings = {
+  id: string;
+  office_address: string;
+  office_lat: number;
+  office_lng: number;
+  geofence_radius_meters: number;
+  timezone: string;
+  late_threshold_time: string;
+  max_gps_accuracy_meters: number;
+  updated_at?: string;
+  updated_by?: string | null;
+};
+
+type AttendanceRecord = {
+  id: string;
+  profile_id: string;
+  attendance_date: string;
+  check_in_time: string | null;
+  check_in_lat: number | null;
+  check_in_lng: number | null;
+  check_in_accuracy: number | null;
+  check_in_distance_meters: number | null;
+  check_out_time: string | null;
+  check_out_lat: number | null;
+  check_out_lng: number | null;
+  check_out_accuracy: number | null;
+  check_out_distance_meters: number | null;
+  status: 'present' | 'late' | 'incomplete' | 'absent' | 'half_day';
+  verification_status: 'verified' | 'flagged' | 'rejected' | 'manual_override';
+  verification_notes?: string | null;
+  is_corrected: boolean;
+  corrected_by?: string | null;
+  corrected_at?: string | null;
+  correction_reason?: string | null;
+  original_data?: any[] | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function getTodayDateString(timeZone = 'Asia/Kolkata'): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === 'year')?.value;
+  const month = parts.find((p) => p.type === 'month')?.value;
+  const day = parts.find((p) => p.type === 'day')?.value;
+  return `${year}-${month}-${day}`;
+}
+
+function formatAttendanceTime(isoString: string | null | undefined, timeZone = 'Asia/Kolkata'): string {
+  if (!isoString) return '—';
+  try {
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    }).format(new Date(isoString));
+  } catch {
+    return '—';
+  }
+}
+
+function formatDistanceMeters(meters: number | null | undefined): string {
+  if (meters == null || isNaN(meters)) return '—';
+  if (meters < 1000) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(2)} km`;
+}
+
+function calculateWorkDuration(checkIn: string | null | undefined, checkOut: string | null | undefined): string {
+  if (!checkIn) return '—';
+  const start = new Date(checkIn).getTime();
+  const end = checkOut ? new Date(checkOut).getTime() : Date.now();
+  if (isNaN(start) || isNaN(end) || end <= start) return '—';
+  const diffMs = end - start;
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const mins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  if (hours === 0) return `${mins}m`;
+  return `${hours}h ${mins}m`;
+}
+
+function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
+  const [record, setRecord] = useState<AttendanceRecord | null>(null);
+  const [settings, setSettings] = useState<AttendanceSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState(false);
+  const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+
+  const todayStr = useMemo(() => getTodayDateString(), []);
+
+  const loadAttendance = async () => {
+    try {
+      setLoading(true);
+      const [settingsRes, recordRes] = await Promise.all([
+        supabase.from('attendance_settings').select('*').eq('id', 'default').maybeSingle(),
+        supabase.from('attendance_records').select('*').eq('profile_id', profile.id).eq('attendance_date', todayStr).maybeSingle(),
+      ]);
+
+      if (settingsRes.data) {
+        setSettings(settingsRes.data);
+      }
+      if (recordRes.data) {
+        setRecord(recordRes.data);
+      } else {
+        setRecord(null);
+      }
+    } catch (err: any) {
+      console.error('Error loading attendance status:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAttendance();
+  }, [profile.id, todayStr]);
+
+  const handleAction = (action: 'check_in' | 'check_out') => {
+    setMessage(null);
+    if (!navigator.geolocation) {
+      setMessage({ type: 'error', text: 'Geolocation is not supported by your browser.' });
+      return;
+    }
+
+    setActionLoading(true);
+    setMessage({
+      type: 'info',
+      text: 'Acquiring GPS location... Please allow browser location access when prompted.',
+    });
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords;
+        try {
+          const rpcName = action === 'check_in' ? 'record_attendance_check_in' : 'record_attendance_check_out';
+          const { data, error } = await supabase.rpc(rpcName, {
+            p_latitude: latitude,
+            p_longitude: longitude,
+            p_accuracy: accuracy,
+          });
+
+          if (error) {
+            setMessage({ type: 'error', text: error.message || `Failed to record ${action.replace('_', ' ')}.` });
+            return;
+          }
+
+          if (data?.record) {
+            setRecord(data.record);
+            setMessage({ type: 'success', text: data.message || `Successfully recorded ${action.replace('_', ' ')}!` });
+          } else {
+            await loadAttendance();
+            setMessage({ type: 'success', text: `Attendance updated successfully.` });
+          }
+        } catch (rpcErr: any) {
+          setMessage({ type: 'error', text: rpcErr.message || 'Server error recording attendance.' });
+        } finally {
+          setActionLoading(false);
+        }
+      },
+      (geoError) => {
+        setActionLoading(false);
+        if (geoError.code === 1) {
+          setMessage({
+            type: 'error',
+            text: 'Location permission was denied. Please allow location access in your browser settings to verify your attendance within the office geofence.',
+          });
+        } else if (geoError.code === 2) {
+          setMessage({
+            type: 'error',
+            text: 'GPS position unavailable. Please ensure your device location is enabled and try again.',
+          });
+        } else if (geoError.code === 3) {
+          setMessage({
+            type: 'error',
+            text: 'Location request timed out. Please try again with clear GPS signal.',
+          });
+        } else {
+          setMessage({
+            type: 'error',
+            text: 'GPS error: ' + (geoError.message || 'Could not acquire location.'),
+          });
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
+      }
+    );
+  };
+
+  const isCheckedIn = !!record?.check_in_time;
+  const isCheckedOut = !!record?.check_out_time;
+
+  return (
+    <section className="attendance-widget-card">
+      <div className="attendance-widget-header">
+        <div className="attendance-widget-title-group">
+          <p className="eyebrow" style={{ display: 'flex', alignItems: 'center', gap: 6, margin: 0 }}>
+            <MapPin size={13} style={{ color: '#4a5c2d' }} />
+            Office GPS Attendance / 100m Geofence
+          </p>
+          <h2>Today&apos;s Attendance</h2>
+          <p>
+            Registered Office: {settings?.office_address || '2/116, Daya Sadan Main Road, Pallavan Nagar, Koyambedu, Chennai'} • Timezone: {settings?.timezone || 'Asia/Kolkata'}
+          </p>
+        </div>
+
+        <div style={{ textAlign: 'right' }}>
+          <span style={{ font: "11px 'DM Mono', monospace", color: '#77796f', textTransform: 'uppercase' }}>
+            Shift Threshold: {settings?.late_threshold_time ? formatAttendanceTime(`1970-01-01T${settings.late_threshold_time}Z`) : '10:00 AM IST'}
+          </span>
+        </div>
+      </div>
+
+      <div className="attendance-widget-body">
+        <div className="attendance-status-box">
+          <div
+            className={`attendance-status-icon-wrap ${
+              isCheckedOut ? 'done' : isCheckedIn ? (record?.status === 'late' ? 'late' : 'active') : ''
+            }`}
+          >
+            {isCheckedOut ? (
+              <CheckCircle2 size={24} />
+            ) : isCheckedIn ? (
+              record?.status === 'late' ? <Clock3 size={24} /> : <Check size={24} />
+            ) : (
+              <MapPin size={24} />
+            )}
+          </div>
+
+          <div className="attendance-status-details">
+            {loading ? (
+              <span>Checking attendance status...</span>
+            ) : isCheckedOut ? (
+              <>
+                <strong>Workday Completed</strong>
+                <span>
+                  Checked In: {formatAttendanceTime(record.check_in_time)} • Checked Out: {formatAttendanceTime(record.check_out_time)} ({calculateWorkDuration(record.check_in_time, record.check_out_time)})
+                </span>
+              </>
+            ) : isCheckedIn ? (
+              <>
+                <strong>
+                  Checked In — {record.status === 'late' ? 'Late Arrival' : 'On Time'}
+                  {record.verification_status === 'flagged' && <span style={{ color: '#986a30', fontSize: 11, fontWeight: 500, marginLeft: 8 }}>(Marginal GPS Accuracy)</span>}
+                </strong>
+                <span>
+                  Checked in at {formatAttendanceTime(record.check_in_time)} ({formatDistanceMeters(record.check_in_distance_meters)} from office, ±{Math.round(record.check_in_accuracy || 0)}m GPS accuracy)
+                </span>
+              </>
+            ) : (
+              <>
+                <strong>Not Checked In Today</strong>
+                <span>
+                  Attendance must be marked within 100 metres of the registered office. Device location will only be captured when you click Check In.
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="attendance-actions-group">
+          <button
+            type="button"
+            className="attendance-btn-checkin"
+            disabled={loading || actionLoading || isCheckedIn}
+            onClick={() => handleAction('check_in')}
+            title={isCheckedIn ? 'You have already checked in today' : 'Record check-in within office radius'}
+          >
+            <Crosshair size={16} />
+            {isCheckedIn ? 'Checked In' : 'Check In'}
+          </button>
+
+          <button
+            type="button"
+            className="attendance-btn-checkout"
+            disabled={loading || actionLoading || !isCheckedIn || isCheckedOut}
+            onClick={() => handleAction('check_out')}
+            title={
+              !isCheckedIn
+                ? 'Check in is required before checking out'
+                : isCheckedOut
+                ? 'Already checked out for today'
+                : 'Record check-out within office radius'
+            }
+          >
+            <LogOut size={16} />
+            {isCheckedOut ? 'Checked Out' : 'Check Out'}
+          </button>
+        </div>
+      </div>
+
+      {message && (
+        <div className={`attendance-alert ${message.type}`}>
+          {message.type === 'error' && <AlertTriangle size={16} style={{ flexShrink: 0 }} />}
+          {message.type === 'success' && <CheckCircle2 size={16} style={{ flexShrink: 0 }} />}
+          {message.type === 'info' && <Clock size={16} style={{ flexShrink: 0 }} />}
+          <div style={{ flex: 1 }}>{message.text}</div>
+          <button
+            type="button"
+            onClick={() => setMessage(null)}
+            style={{ border: 0, background: 'none', color: 'inherit', padding: 2, cursor: 'pointer' }}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function Dashboard({
@@ -791,6 +1116,9 @@ function Dashboard({
         </div>
       ))}
     </section>
+
+    {/* Office GPS Attendance Widget */}
+    <DashboardAttendanceWidget profile={profile} />
 
     <div className="dashboard-grid">
       <section className="panel activity-panel">
@@ -2598,6 +2926,1109 @@ function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profi
       ? `Activate ${state.profile.full_name}'s account?`
       : `Deactivate ${state.profile.full_name}'s account? They will not be able to sign in.`;
   return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}><section className="confirm-dialog"><p>{text}</p><div className="drawer-footer"><button className="outline-button" onClick={onCancel} disabled={working}>Cancel</button><button className="lime-button" onClick={onConfirm} disabled={working}>{working ? 'Saving…' : 'Confirm'}</button></div></section></div>;
+}
+
+// ============================================================================
+// ADMIN ATTENDANCE MANAGEMENT COMPONENTS
+// ============================================================================
+
+function AttendanceAdminPage({
+  profile,
+  profiles,
+}: {
+  profile: Profile;
+  profiles: Profile[];
+}) {
+  const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateString());
+  const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [settings, setSettings] = useState<AttendanceSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [dataError, setDataError] = useState('');
+
+  // Filter states
+  const [searchQuery, setSearchQuery] = useState('');
+  const [roleFilter, setRoleFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+
+  // Modal states
+  const [selectedCorrection, setSelectedCorrection] = useState<{
+    record?: AttendanceRecord;
+    profile: Profile;
+    date: string;
+  } | null>(null);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showManualModal, setShowManualModal] = useState(false);
+
+  const activeProfiles = useMemo(() => profiles.filter((p) => p.is_active), [profiles]);
+  const todayStr = useMemo(() => getTodayDateString(), []);
+
+  const loadData = async () => {
+    setLoading(true);
+    setDataError('');
+    try {
+      const [settingsRes, recordsRes] = await Promise.all([
+        supabase.from('attendance_settings').select('*').eq('id', 'default').maybeSingle(),
+        supabase.from('attendance_records').select('*').eq('attendance_date', selectedDate),
+      ]);
+
+      if (settingsRes.error) throw settingsRes.error;
+      if (recordsRes.error) throw recordsRes.error;
+
+      if (settingsRes.data) setSettings(settingsRes.data);
+      if (recordsRes.data) setRecords(recordsRes.data);
+    } catch (err: any) {
+      console.error('Error loading attendance admin data:', err);
+      setDataError('Unable to load attendance records: ' + (err.message || 'Unknown error'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, [selectedDate]);
+
+  // Quick date switches
+  const handleSetToday = () => setSelectedDate(todayStr);
+  const handleSetYesterday = () => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    setSelectedDate(getTodayDateString());
+    // Use manual date calc for yesterday
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(d);
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const day = parts.find((p) => p.type === 'day')?.value;
+    setSelectedDate(`${y}-${m}-${day}`);
+  };
+
+  // Metrics computation for selected date
+  const metrics = useMemo(() => {
+    const totalActive = activeProfiles.length;
+    const checkedInCount = records.filter((r) => r.check_in_time).length;
+    const onTimeCount = records.filter((r) => r.status === 'present').length;
+    const lateCount = records.filter((r) => r.status === 'late').length;
+    const incompleteCount = records.filter((r) => r.check_in_time && !r.check_out_time).length;
+    const absentCount = Math.max(0, totalActive - checkedInCount);
+
+    return { totalActive, checkedInCount, onTimeCount, lateCount, incompleteCount, absentCount };
+  }, [activeProfiles, records]);
+
+  // Filtered rows
+  const filteredEmployees = useMemo(() => {
+    return activeProfiles.filter((emp) => {
+      // Search filter
+      const matchesSearch =
+        !searchQuery.trim() ||
+        emp.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        emp.email.toLowerCase().includes(searchQuery.toLowerCase());
+
+      // Role filter
+      const matchesRole = roleFilter === 'all' || emp.role === roleFilter;
+
+      // Status filter
+      const matchedRecord = records.find((r) => r.profile_id === emp.id);
+      let derivedStatus = 'absent';
+      if (matchedRecord) {
+        if (!matchedRecord.check_out_time && selectedDate < todayStr) {
+          derivedStatus = 'incomplete';
+        } else {
+          derivedStatus = matchedRecord.status;
+        }
+      }
+
+      const matchesStatus = statusFilter === 'all' || derivedStatus === statusFilter;
+
+      return matchesSearch && matchesRole && matchesStatus;
+    });
+  }, [activeProfiles, records, searchQuery, roleFilter, statusFilter, selectedDate, todayStr]);
+
+  return (
+    <div className="page-content">
+      <div className="page-title-row">
+        <div>
+          <span className="section-tag">Office Operations</span>
+          <h1>Attendance</h1>
+          <p className="subtitle">
+            Monitor real-time team presence, office GPS geofence verification, and working hours.
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="outline-button"
+            onClick={() => setShowSettingsModal(true)}
+            style={{ fontSize: 12, padding: '10px 16px' }}
+          >
+            <Settings size={15} />
+            Office Settings
+          </button>
+
+          <button
+            type="button"
+            className="lime-button"
+            onClick={() => setShowManualModal(true)}
+            style={{ fontSize: 12, padding: '10px 16px' }}
+          >
+            <CirclePlus size={15} />
+            Manual Entry
+          </button>
+        </div>
+      </div>
+
+      {/* Date Navigator & Filters Bar */}
+      <div className="filter-bar" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center', marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#ffffff', border: '1px solid #dadad2', padding: '0 12px', height: 42 }}>
+          <Calendar size={15} style={{ color: '#77796f' }} />
+          <input
+            type="date"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            style={{ border: 0, outline: 0, background: 'transparent', fontSize: 13, color: '#20221d', cursor: 'pointer' }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 4 }}>
+          <button
+            type="button"
+            className={`outline-button ${selectedDate === todayStr ? 'active' : ''}`}
+            onClick={handleSetToday}
+            style={{
+              height: 42,
+              padding: '0 14px',
+              fontSize: 12,
+              background: selectedDate === todayStr ? '#20221d' : '#fff',
+              color: selectedDate === todayStr ? '#c3f05a' : '#20221d',
+              borderColor: '#dadad2',
+            }}
+          >
+            Today
+          </button>
+          <button
+            type="button"
+            className="outline-button"
+            onClick={handleSetYesterday}
+            style={{
+              height: 42,
+              padding: '0 14px',
+              fontSize: 12,
+              background: '#fff',
+              color: '#20221d',
+              borderColor: '#dadad2',
+            }}
+          >
+            Yesterday
+          </button>
+        </div>
+
+        <div className="search-box" style={{ height: 42, flex: 1, minWidth: 200 }}>
+          <Search size={15} />
+          <input
+            type="text"
+            placeholder="Search employee by name or email..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+
+        <div className="filter-select" style={{ height: 42 }}>
+          <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="all">All roles</option>
+            <option value="sales">Sales</option>
+            <option value="editor">Editor</option>
+            <option value="script_writer">Script Writer</option>
+            <option value="social_media_manager">Social Media</option>
+            <option value="finance">Finance</option>
+            <option value="admin">Admin</option>
+            <option value="employee">Employee</option>
+          </select>
+        </div>
+
+        <div className="filter-select" style={{ height: 42 }}>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">All statuses</option>
+            <option value="present">Present (On Time)</option>
+            <option value="late">Late Arrival</option>
+            <option value="incomplete">Incomplete / Missing Check-Out</option>
+            <option value="absent">Absent / Not Checked In</option>
+            <option value="half_day">Half Day</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Summary Metrics */}
+      <section className="admin-attendance-grid">
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Active Team</span>
+            <UsersRound size={16} />
+          </div>
+          <strong>{metrics.totalActive}</strong>
+          <small>Total active staff</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>On Time</span>
+            <CheckCircle2 size={16} style={{ color: '#43724e' }} />
+          </div>
+          <strong style={{ color: '#386342' }}>{metrics.onTimeCount}</strong>
+          <small>Before threshold ({settings?.late_threshold_time?.slice(0, 5) || '10:00'})</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Late Arrivals</span>
+            <Clock3 size={16} style={{ color: '#986a30' }} />
+          </div>
+          <strong style={{ color: '#986a30' }}>{metrics.lateCount}</strong>
+          <small>After threshold</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Incomplete</span>
+            <AlertTriangle size={16} style={{ color: '#99544a' }} />
+          </div>
+          <strong style={{ color: '#99544a' }}>{metrics.incompleteCount}</strong>
+          <small>Missing check-out</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Not Checked In</span>
+            <Clock size={16} style={{ color: '#77796f' }} />
+          </div>
+          <strong style={{ color: '#555850' }}>{metrics.absentCount}</strong>
+          <small>No check-in record</small>
+        </div>
+      </section>
+
+      {/* Attendance Table */}
+      {dataError && (
+        <div className="attendance-alert error" style={{ marginBottom: 20 }}>
+          <AlertTriangle size={16} />
+          <span>{dataError}</span>
+          <button type="button" onClick={loadData} className="outline-button" style={{ marginLeft: 'auto', padding: '4px 8px', fontSize: 11 }}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      <div className="lead-table-wrap">
+        {loading ? (
+          <div style={{ padding: '60px 20px', textAlign: 'center' }}>
+            <div className="spinner" style={{ margin: 'auto' }} />
+            <p style={{ marginTop: 12, color: '#77796f', fontSize: 13 }}>Loading attendance records for {selectedDate}...</p>
+          </div>
+        ) : filteredEmployees.length === 0 ? (
+          <div style={{ padding: '60px 20px', textAlign: 'center' }}>
+            <p style={{ color: '#77796f', fontSize: 14 }}>No employee records match the selected filters for {selectedDate}.</p>
+          </div>
+        ) : (
+          <table className="lead-table">
+            <thead>
+              <tr>
+                <th>Employee</th>
+                <th>Status</th>
+                <th>Check-In</th>
+                <th>Check-Out</th>
+                <th>Work Hours</th>
+                <th>Verification & Audit</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredEmployees.map((emp) => {
+                const rec = records.find((r) => r.profile_id === emp.id);
+
+                let displayStatus = 'absent';
+                if (rec) {
+                  if (!rec.check_out_time && selectedDate < todayStr) {
+                    displayStatus = 'incomplete';
+                  } else {
+                    displayStatus = rec.status;
+                  }
+                }
+
+                return (
+                  <tr key={emp.id}>
+                    <td>
+                      <div className="table-person">
+                        <div className="small-avatar">{emp.full_name.slice(0, 1).toUpperCase()}</div>
+                        <div>
+                          <strong>{emp.full_name}</strong>
+                          <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span className={`team-role-pill ${emp.role}`} style={{ padding: '2px 6px', fontSize: 9 }}>
+                              {emp.role.split('_').join(' ')}
+                            </span>
+                            <span style={{ color: '#8d9488', fontSize: 11 }}>{emp.email}</span>
+                          </span>
+                        </div>
+                      </div>
+                    </td>
+
+                    <td>
+                      <span className={`att-pill ${displayStatus}`}>
+                        {displayStatus === 'present'
+                          ? 'Present'
+                          : displayStatus === 'late'
+                          ? 'Late Arrival'
+                          : displayStatus === 'incomplete'
+                          ? 'Incomplete'
+                          : displayStatus === 'half_day'
+                          ? 'Half Day'
+                          : 'Not Checked In'}
+                      </span>
+                    </td>
+
+                    <td>
+                      {rec?.check_in_time ? (
+                        <div>
+                          <strong style={{ fontSize: 12, color: '#20221d', display: 'block' }}>
+                            {formatAttendanceTime(rec.check_in_time)}
+                          </strong>
+                          <span style={{ fontSize: 11, color: '#77796f', display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span>{formatDistanceMeters(rec.check_in_distance_meters)}</span>
+                            <span>•</span>
+                            <span>±{Math.round(rec.check_in_accuracy || 0)}m</span>
+                            {rec.check_in_lat && rec.check_in_lng && (
+                              <a
+                                href={`https://www.google.com/maps?q=${rec.check_in_lat},${rec.check_in_lng}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="map-pin-link"
+                                title="View check-in GPS coordinates on Google Maps"
+                              >
+                                <MapPin size={11} />
+                                Map
+                                <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <span style={{ color: '#a3a99f' }}>—</span>
+                      )}
+                    </td>
+
+                    <td>
+                      {rec?.check_out_time ? (
+                        <div>
+                          <strong style={{ fontSize: 12, color: '#20221d', display: 'block' }}>
+                            {formatAttendanceTime(rec.check_out_time)}
+                          </strong>
+                          <span style={{ fontSize: 11, color: '#77796f', display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span>{formatDistanceMeters(rec.check_out_distance_meters)}</span>
+                            {rec.check_out_lat && rec.check_out_lng && (
+                              <a
+                                href={`https://www.google.com/maps?q=${rec.check_out_lat},${rec.check_out_lng}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="map-pin-link"
+                                title="View check-out GPS coordinates on Google Maps"
+                              >
+                                <MapPin size={11} />
+                                Map
+                                <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <span style={{ color: '#a3a99f' }}>—</span>
+                      )}
+                    </td>
+
+                    <td>
+                      <span style={{ font: "12px 'DM Mono', monospace", color: '#30342d' }}>
+                        {calculateWorkDuration(rec?.check_in_time, rec?.check_out_time)}
+                      </span>
+                    </td>
+
+                    <td>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        {rec ? (
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span className={`att-pill ${rec.verification_status}`}>
+                              {rec.verification_status === 'verified'
+                                ? 'GPS Verified'
+                                : rec.verification_status === 'flagged'
+                                ? 'GPS Flagged'
+                                : rec.verification_status === 'manual_override'
+                                ? 'Manual Override'
+                                : rec.verification_status}
+                            </span>
+                            {rec.is_corrected && (
+                              <span
+                                className="att-pill manual"
+                                title={rec.correction_reason || 'Record corrected by Admin'}
+                              >
+                                Audited
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 11, color: '#8c9388' }}>Unrecorded</span>
+                        )}
+
+                        {rec?.is_corrected && rec.correction_reason && (
+                          <span style={{ fontSize: 10, color: '#77796f', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={rec.correction_reason}>
+                            Reason: {rec.correction_reason}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    <td style={{ textAlign: 'right' }}>
+                      <button
+                        type="button"
+                        className="outline-button"
+                        style={{ padding: '5px 10px', fontSize: 11 }}
+                        onClick={() => setSelectedCorrection({ record: rec, profile: emp, date: selectedDate })}
+                      >
+                        {rec ? 'Correct' : 'Mark'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Auditable Attendance Correction Modal */}
+      {selectedCorrection && (
+        <AttendanceCorrectionModal
+          target={selectedCorrection}
+          settings={settings}
+          onClose={() => setSelectedCorrection(null)}
+          onSuccess={() => {
+            setSelectedCorrection(null);
+            loadData();
+          }}
+        />
+      )}
+
+      {/* Office & Geofence Settings Modal */}
+      {showSettingsModal && (
+        <AttendanceSettingsModal
+          settings={settings}
+          onClose={() => setShowSettingsModal(false)}
+          onSuccess={(newSettings) => {
+            setSettings(newSettings);
+            setShowSettingsModal(false);
+          }}
+        />
+      )}
+
+      {/* Manual Entry Modal */}
+      {showManualModal && (
+        <AttendanceManualEntryModal
+          profiles={activeProfiles}
+          defaultDate={selectedDate}
+          onClose={() => setShowManualModal(false)}
+          onSuccess={() => {
+            setShowManualModal(false);
+            loadData();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// AUDITABLE ATTENDANCE CORRECTION MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceCorrectionModal({
+  target,
+  settings,
+  onClose,
+  onSuccess,
+}: {
+  target: { record?: AttendanceRecord; profile: Profile; date: string };
+  settings: AttendanceSettings | null;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const { record, profile, date } = target;
+  const isEditing = !!record;
+
+  const [status, setStatus] = useState<AttendanceRecord['status']>(record?.status || 'present');
+  const [checkInTime, setCheckInTime] = useState<string>(() => {
+    if (!record?.check_in_time) return '09:30';
+    const d = new Date(record.check_in_time);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  });
+  const [checkOutTime, setCheckOutTime] = useState<string>(() => {
+    if (!record?.check_out_time) return '';
+    const d = new Date(record.check_out_time);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  });
+  const [reason, setReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (reason.trim().length < 5) {
+      setError('A detailed correction reason (minimum 5 characters) is mandatory for audit trail compliance.');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      // Build ISO timestamps in UTC corresponding to the date and time in Asia/Kolkata
+      let checkInIso: string | null = null;
+      let checkOutIso: string | null = null;
+
+      if (checkInTime) {
+        checkInIso = new Date(`${date}T${checkInTime}:00+05:30`).toISOString();
+      }
+      if (checkOutTime) {
+        checkOutIso = new Date(`${date}T${checkOutTime}:00+05:30`).toISOString();
+      }
+
+      if (isEditing && record) {
+        const { error: rpcError } = await supabase.rpc('admin_correct_attendance', {
+          p_record_id: record.id,
+          p_status: status,
+          p_check_in_time: checkInIso,
+          p_check_out_time: checkOutIso,
+          p_reason: reason.trim(),
+        });
+        if (rpcError) throw rpcError;
+      } else {
+        const { error: rpcError } = await supabase.rpc('admin_create_attendance_record', {
+          p_employee_id: profile.id,
+          p_attendance_date: date,
+          p_status: status,
+          p_check_in_time: checkInIso,
+          p_check_out_time: checkOutIso,
+          p_reason: reason.trim(),
+        });
+        if (rpcError) throw rpcError;
+      }
+
+      onSuccess();
+    } catch (err: any) {
+      setError(err.message || 'Failed to apply attendance adjustment.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 540 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Audited Correction</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>
+              {isEditing ? 'Adjust Attendance' : 'Mark Manual Attendance'}
+            </h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              Employee: <strong>{profile.full_name}</strong> • Date: <strong>{date}</strong>
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Audit Notice */}
+        <div style={{ padding: '10px 14px', background: '#fcf8ee', border: '1px solid #ebd9b5', borderRadius: 6, fontSize: 11, color: '#7a5a22', marginBottom: 18 }}>
+          <strong>Immutable Audit Trail:</strong> Original GPS coordinates, distances, and server timestamps are permanently retained in the audit history.
+        </div>
+
+        {/* Existing Evidence Display */}
+        {record && (
+          <div style={{ padding: '12px 14px', background: '#f5f7f2', border: '1px solid #dce0d5', borderRadius: 6, fontSize: 12, marginBottom: 18 }}>
+            <div style={{ fontWeight: 600, color: '#33382d', marginBottom: 6 }}>Recorded Evidence:</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, color: '#687064' }}>
+              <div>Original Check-In: <strong>{formatAttendanceTime(record.check_in_time)}</strong></div>
+              <div>Original Check-Out: <strong>{formatAttendanceTime(record.check_out_time)}</strong></div>
+              <div>Office Distance: <strong>{formatDistanceMeters(record.check_in_distance_meters)}</strong></div>
+              <div>GPS Accuracy: <strong>±{Math.round(record.check_in_accuracy || 0)}m</strong></div>
+            </div>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Attendance Status</label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value as any)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              >
+                <option value="present">Present (On Time)</option>
+                <option value="late">Late Arrival</option>
+                <option value="half_day">Half Day</option>
+                <option value="incomplete">Incomplete</option>
+                <option value="absent">Absent</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Shift Threshold</label>
+              <input
+                type="text"
+                disabled
+                value={settings?.late_threshold_time ? `${settings.late_threshold_time.slice(0, 5)} IST` : '10:00 IST'}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#f5f5f4', fontSize: 13, color: '#78716c' }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-In Time</label>
+              <input
+                type="time"
+                value={checkInTime}
+                onChange={(e) => setCheckInTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-Out Time</label>
+              <input
+                type="time"
+                value={checkOutTime}
+                onChange={(e) => setCheckOutTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>
+              Correction Reason <span style={{ color: '#99544a' }}>*</span>
+            </label>
+            <textarea
+              required
+              rows={3}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Approved on-duty client visit; GPS device malfunction verified in person..."
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13, resize: 'vertical' }}
+            />
+            <small style={{ color: '#77796f', fontSize: 10 }}>Minimum 5 characters. Stored permanently in audit log.</small>
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Saving Correction…' : 'Save Correction'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// OFFICE & GEOFENCE SETTINGS MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceSettingsModal({
+  settings,
+  onClose,
+  onSuccess,
+}: {
+  settings: AttendanceSettings | null;
+  onClose: () => void;
+  onSuccess: (updated: AttendanceSettings) => void;
+}) {
+  const [address, setAddress] = useState(
+    settings?.office_address || '2/116, Daya Sadan Main Road, Pallavan Nagar, Koyambedu, Chennai, Tamil Nadu 600107, India'
+  );
+  const [lat, setLat] = useState(settings?.office_lat?.toString() || '13.0693169');
+  const [lng, setLng] = useState(settings?.office_lng?.toString() || '80.1814571');
+  const [radius, setRadius] = useState(settings?.geofence_radius_meters?.toString() || '100');
+  const [timezone, setTimezone] = useState(settings?.timezone || 'Asia/Kolkata');
+  const [lateTime, setLateTime] = useState(settings?.late_threshold_time || '10:00:00');
+  const [maxAccuracy, setMaxAccuracy] = useState(settings?.max_gps_accuracy_meters?.toString() || '150');
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const parsedLat = parseFloat(lat);
+      const parsedLng = parseFloat(lng);
+      const parsedRadius = parseInt(radius, 10);
+      const parsedMaxAccuracy = parseFloat(maxAccuracy);
+
+      if (isNaN(parsedLat) || parsedLat < -90 || parsedLat > 90) throw new Error('Invalid latitude.');
+      if (isNaN(parsedLng) || parsedLng < -180 || parsedLng > 180) throw new Error('Invalid longitude.');
+      if (isNaN(parsedRadius) || parsedRadius < 10) throw new Error('Geofence radius must be at least 10 metres.');
+      if (isNaN(parsedMaxAccuracy) || parsedMaxAccuracy < 10) throw new Error('Max accuracy threshold must be at least 10 metres.');
+
+      const payload = {
+        office_address: address.trim(),
+        office_lat: parsedLat,
+        office_lng: parsedLng,
+        geofence_radius_meters: parsedRadius,
+        timezone: timezone.trim(),
+        late_threshold_time: lateTime,
+        max_gps_accuracy_meters: parsedMaxAccuracy,
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data, error: updateError } = await supabase
+        .from('attendance_settings')
+        .update(payload)
+        .eq('id', 'default')
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+      onSuccess(data);
+    } catch (err: any) {
+      setError(err.message || 'Failed to save office settings.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 560 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Location & Policy</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>Office Geofence Settings</h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              These parameters are stored securely in Supabase and enforced server-side on all check-ins.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Registered Office Address</label>
+            <input
+              type="text"
+              required
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+            />
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Latitude</label>
+              <input
+                type="number"
+                step="any"
+                required
+                value={lat}
+                onChange={(e) => setLat(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Longitude</label>
+              <input
+                type="number"
+                step="any"
+                required
+                value={lng}
+                onChange={(e) => setLng(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Geofence Radius (metres)</label>
+              <input
+                type="number"
+                min="10"
+                max="5000"
+                required
+                value={radius}
+                onChange={(e) => setRadius(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Standard: 100 metres</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Late Arrival Threshold</label>
+              <input
+                type="time"
+                step="1"
+                required
+                value={lateTime.slice(0, 5)}
+                onChange={(e) => setLateTime(`${e.target.value}:00`)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Default: 10:00 AM IST</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Timezone</label>
+              <input
+                type="text"
+                required
+                value={timezone}
+                onChange={(e) => setTimezone(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Default: Asia/Kolkata</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Max GPS Accuracy (metres)</label>
+              <input
+                type="number"
+                min="20"
+                max="1000"
+                required
+                value={maxAccuracy}
+                onChange={(e) => setMaxAccuracy(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Rejects readings worse than ±150m</small>
+            </div>
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Saving…' : 'Save Settings'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// MANUAL ATTENDANCE ENTRY MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceManualEntryModal({
+  profiles,
+  defaultDate,
+  onClose,
+  onSuccess,
+}: {
+  profiles: Profile[];
+  defaultDate: string;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [employeeId, setEmployeeId] = useState(profiles[0]?.id || '');
+  const [date, setDate] = useState(defaultDate);
+  const [status, setStatus] = useState<AttendanceRecord['status']>('present');
+  const [checkInTime, setCheckInTime] = useState('09:30');
+  const [checkOutTime, setCheckOutTime] = useState('18:00');
+  const [reason, setReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!employeeId) {
+      setError('Please select an employee.');
+      return;
+    }
+    if (reason.trim().length < 5) {
+      setError('A detailed reason (minimum 5 characters) is required.');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      let checkInIso: string | null = null;
+      let checkOutIso: string | null = null;
+      if (checkInTime) {
+        checkInIso = new Date(`${date}T${checkInTime}:00+05:30`).toISOString();
+      }
+      if (checkOutTime) {
+        checkOutIso = new Date(`${date}T${checkOutTime}:00+05:30`).toISOString();
+      }
+
+      const { error: rpcError } = await supabase.rpc('admin_create_attendance_record', {
+        p_employee_id: employeeId,
+        p_attendance_date: date,
+        p_status: status,
+        p_check_in_time: checkInIso,
+        p_check_out_time: checkOutIso,
+        p_reason: reason.trim(),
+      });
+
+      if (rpcError) throw rpcError;
+      onSuccess();
+    } catch (err: any) {
+      setError(err.message || 'Failed to create manual attendance entry.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 540 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Manual Override</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>Record Manual Attendance</h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              Create an attendance record for staff on approved leave, client site visit, or missing device entry.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Employee</label>
+            <select
+              required
+              value={employeeId}
+              onChange={(e) => setEmployeeId(e.target.value)}
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+            >
+              {profiles.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.full_name} ({p.role.split('_').join(' ')}) — {p.email}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Attendance Date</label>
+              <input
+                type="date"
+                required
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Status</label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value as any)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              >
+                <option value="present">Present (On Time)</option>
+                <option value="late">Late Arrival</option>
+                <option value="half_day">Half Day</option>
+                <option value="absent">Absent</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-In Time</label>
+              <input
+                type="time"
+                value={checkInTime}
+                onChange={(e) => setCheckInTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-Out Time</label>
+              <input
+                type="time"
+                value={checkOutTime}
+                onChange={(e) => setCheckOutTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>
+              Reason for Manual Entry <span style={{ color: '#99544a' }}>*</span>
+            </label>
+            <textarea
+              required
+              rows={3}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Employee visited client on-site in Guindy with director approval..."
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13, resize: 'vertical' }}
+            />
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Creating Entry…' : 'Record Entry'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
 }
 
 type MetaLeadForm = {
