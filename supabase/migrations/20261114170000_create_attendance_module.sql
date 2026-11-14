@@ -163,7 +163,7 @@ CREATE POLICY "prevent client delete on attendance_records"
 CREATE OR REPLACE FUNCTION public.record_attendance_check_in(
   p_latitude numeric,
   p_longitude numeric,
-  p_accuracy numeric
+  p_accuracy numeric DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -301,7 +301,7 @@ $$;
 CREATE OR REPLACE FUNCTION public.record_attendance_check_out(
   p_latitude numeric,
   p_longitude numeric,
-  p_accuracy numeric
+  p_accuracy numeric DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -500,6 +500,10 @@ BEGIN
 
   IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE id = p_employee_id) THEN
     RAISE EXCEPTION 'Employee profile not found.';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.attendance_records WHERE profile_id = p_employee_id AND attendance_date = p_attendance_date) THEN
+    RAISE EXCEPTION 'An attendance record already exists for this employee on %. Please use the correction tool to modify existing records.', p_attendance_date;
   END IF;
 
   INSERT INTO public.attendance_records (
