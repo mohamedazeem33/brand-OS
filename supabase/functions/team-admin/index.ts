@@ -261,9 +261,25 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // PATCH — employee account management OR Meta Lead Form management
-    if (req.method === "PATCH") {
-      const body = await req.json();
+    // PATCH or DELETE — employee account management OR Meta Lead Form management
+    if (req.method === "PATCH" || req.method === "DELETE") {
+      let body: any = {};
+      try {
+        body = await req.json();
+      } catch {
+        body = {};
+      }
+      if (req.method === "DELETE" && !body.action) {
+        body.action = "delete_employee";
+      }
+      if (req.method === "DELETE" && !body.user_id) {
+        try {
+          const url = new URL(req.url);
+          body.user_id = url.searchParams.get("user_id") || "";
+        } catch {
+          // ignore
+        }
+      }
 
       // ==========================================
       // Meta Lead Form Registry Actions (Admin-only)
@@ -738,15 +754,6 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-        if (updateErr) return errorResponse("Failed to deactivate form: " + updateErr.message, 500);
-
-        return json({
-          success: true,
-          message: `Form '${existingForms[targetIdx].name}' deactivated and removed from active list.`,
-          forms: updatedList,
-        });
-      }
-
       // ==========================================
       // Employee Account Actions (require user_id)
       // ==========================================
@@ -759,10 +766,79 @@ Deno.serve(async (req: Request) => {
       // Fetch the target profile to ensure account exists
       const { data: target, error: fetchErr } = await supabase
         .from("profiles")
-        .select("id, email, role, is_active")
+        .select("id, email, full_name, role, is_active")
         .eq("id", userId)
         .maybeSingle();
       if (fetchErr || !target) return errorResponse("Employee not found.", 404);
+
+      // Delete Employee Account (Permanent deletion, business records preserved)
+      if (body.action === "delete_employee" || req.method === "DELETE") {
+        // Prevent deleting your own account (lockout guard)
+        if (userId === admin.id) {
+          return errorResponse("You cannot delete your own account.", 400);
+        }
+
+        // Prevent deleting admin accounts through employee management
+        if (target.role === "admin") {
+          return errorResponse("Admin accounts cannot be deleted through this interface.", 400);
+        }
+
+        // Business Records Preservation & Foreign Key Integrity:
+        // 1. Unassign leads from this employee
+        await supabase
+          .from("leads")
+          .update({ assigned_to: null })
+          .eq("assigned_to", userId);
+
+        // 2. Reassign leads created by this employee to the deleting admin (preserves lead audit history)
+        await supabase
+          .from("leads")
+          .update({ created_by: admin.id })
+          .eq("created_by", userId);
+
+        // 3. Reassign soft-delete / unqualified tracking if applicable
+        await supabase
+          .from("leads")
+          .update({ deleted_by: admin.id })
+          .eq("deleted_by", userId);
+
+        await supabase
+          .from("leads")
+          .update({ unqualified_by: admin.id })
+          .eq("unqualified_by", userId);
+
+        // 4. Unassign clients and reassign client creation to admin
+        await supabase
+          .from("clients")
+          .update({ assigned_to: null })
+          .eq("assigned_to", userId);
+
+        await supabase
+          .from("clients")
+          .update({ created_by: admin.id })
+          .eq("created_by", userId);
+
+        // 5. Reassign call logs to admin
+        await supabase
+          .from("lead_call_logs")
+          .update({ salesperson_id: admin.id })
+          .eq("salesperson_id", userId);
+
+        // 6. Delete user from Supabase Auth (Auth API)
+        const { error: authDeleteErr } = await supabase.auth.admin.deleteUser(userId);
+        if (authDeleteErr) {
+          console.error("Auth admin deleteUser failed for user:", userId, authDeleteErr.message);
+          return errorResponse(`Could not delete user from authentication system: ${authDeleteErr.message}`, 500);
+        }
+
+        // 7. Ensure profile row is removed if cascade was not triggered
+        await supabase.from("profiles").delete().eq("id", userId);
+
+        return json({
+          success: true,
+          message: `Employee ${target.full_name || target.email} permanently deleted. All business records have been preserved.`,
+        });
+      }
 
       // Update role
       if (body.action === "set_role") {
@@ -793,9 +869,35 @@ Deno.serve(async (req: Request) => {
           if ((count ?? 0) <= 1) return errorResponse("Cannot deactivate the last active admin.", 400);
         }
 
-        const { error } = await supabase.from("profiles").update({ is_active: nextActive }).eq("id", userId);
-        if (error) return errorResponse("Could not update the account status.", 500);
-        return json({ success: true });
+        // Update Supabase Auth user ban duration:
+        // '876000h' (~100 years) bans the user from signing in.
+        // 'none' unbans the user, restoring sign-in capability.
+        const { error: authBanError } = await supabase.auth.admin.updateUserById(userId, {
+          ban_duration: nextActive ? "none" : "876000h",
+        });
+
+        if (authBanError) {
+          console.error("Auth admin updateUserById ban toggle failed:", userId, authBanError.message);
+          return errorResponse(`Could not update authentication status: ${authBanError.message}`, 500);
+        }
+
+        const { error: profileError } = await supabase
+          .from("profiles")
+          .update({ is_active: nextActive })
+          .eq("id", userId);
+
+        if (profileError) {
+          // Attempt rollback of auth ban
+          await supabase.auth.admin.updateUserById(userId, {
+            ban_duration: nextActive ? "876000h" : "none",
+          });
+          return errorResponse("Could not update the account status.", 500);
+        }
+
+        return json({
+          success: true,
+          message: nextActive ? "Account activated successfully." : "Account deactivated successfully.",
+        });
       }
 
       // Update credentials (email and/or password)

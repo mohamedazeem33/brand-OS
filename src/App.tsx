@@ -290,8 +290,13 @@ function App() {
   useEffect(() => {
     if (view === 'set_password' || view === 'invite_error') return;
     if (!session) { setProfile(null); setView('login'); return; }
-    supabase.from('profiles').select('id, email, full_name, role, is_active').eq('id', session.user.id).maybeSingle().then(({ data, error }) => {
-      if (error || !data || !data.is_active) { setAuthError('This account does not have workspace access. Contact your administrator.'); setView('login'); }
+    supabase.from('profiles').select('id, email, full_name, role, is_active').eq('id', session.user.id).maybeSingle().then(async ({ data, error }) => {
+      if (error || !data || !data.is_active) {
+        await supabase.auth.signOut().catch(() => {});
+        setProfile(null);
+        setAuthError(data && !data.is_active ? 'This account has been deactivated. Please contact your administrator.' : 'This account does not have workspace access. Contact your administrator.');
+        setView('login');
+      }
       else { setProfile(data as Profile); setView('workspace'); }
     });
   }, [session, view]);
@@ -311,7 +316,14 @@ function Login({ error, onError, agencyBranding }: { error: string; onError: (me
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setLoading(true); onError('');
     const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
-    if (signInError) onError('The email or password is not correct. Please try again.');
+    if (signInError) {
+      const msg = signInError.message.toLowerCase();
+      if (msg.includes('banned') || msg.includes('deactivated') || msg.includes('disabled')) {
+        onError('This account has been deactivated. Please contact your administrator.');
+      } else {
+        onError('The email or password is not correct. Please try again.');
+      }
+    }
     setLoading(false);
   };
   return <main className="login-page">
@@ -3060,10 +3072,10 @@ const teamRoles: { id: string; label: string }[] = [
 ];
 const roleLabels: Record<string, string> = Object.fromEntries(teamRoles.map((r) => [r.id, r.label]));
 
-async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active', payload: Record<string, unknown>) {
+async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active' | 'delete_employee', payload: Record<string, unknown>) {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session?.access_token) throw new Error('You are not signed in.');
-  const method = action === 'create' ? 'POST' : 'PATCH';
+  const method = action === 'create' ? 'POST' : action === 'delete_employee' ? 'DELETE' : 'PATCH';
   const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/team-admin`, {
     method,
     headers: {
@@ -3078,7 +3090,7 @@ async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active', pa
     try { const body = await response.json(); if (body?.error) message = body.error; } catch { /* ignore */ }
     throw new Error(message);
   }
-  return (await response.json()) as { method?: 'invite' | 'temp_password'; temp_password?: string };
+  return (await response.json()) as { method?: 'invite' | 'temp_password'; temp_password?: string; success?: boolean; message?: string };
 }
 
 function TeamPage({ profile }: { profile: Profile }) {
@@ -3091,7 +3103,7 @@ function TeamPage({ profile }: { profile: Profile }) {
   const [statusFilter, setStatusFilter] = useState('All status');
   const [showAdd, setShowAdd] = useState(false);
   const [actionRow, setActionRow] = useState<Profile | null>(null);
-  const [confirmState, setConfirmState] = useState<{ profile: Profile; action: 'set_role' | 'toggle_active'; newRole?: string; newActive?: boolean } | null>(null);
+  const [confirmState, setConfirmState] = useState<{ profile: Profile; action: 'set_role' | 'toggle_active' | 'delete_employee'; newRole?: string; newActive?: boolean } | null>(null);
   const [working, setWorking] = useState(false);
 
   const loadEmployees = async () => {
@@ -3117,6 +3129,8 @@ function TeamPage({ profile }: { profile: Profile }) {
         await callTeamAdmin('set_role', { user_id: confirmState.profile.id, role: confirmState.newRole });
       } else if (confirmState.action === 'toggle_active') {
         await callTeamAdmin('toggle_active', { user_id: confirmState.profile.id, is_active: confirmState.newActive ?? false });
+      } else if (confirmState.action === 'delete_employee') {
+        await callTeamAdmin('delete_employee', { user_id: confirmState.profile.id });
       }
       setConfirmState(null);
       await loadEmployees();
@@ -3195,7 +3209,7 @@ function AddEmployeeModal({ onClose, onCreated }: { onClose: () => void; onCreat
   </div>;
 }
 
-function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profile; onClose: () => void; onConfirm: (action: 'set_role' | 'toggle_active', value: string | boolean) => void }) {
+function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profile; onClose: () => void; onConfirm: (action: 'set_role' | 'toggle_active' | 'delete_employee', value: string | boolean) => void }) {
   const [selectedRole, setSelectedRole] = useState(profile.role);
   return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
     <section className="lead-drawer"><div className="drawer-header"><div><p className="eyebrow">Manage member</p><h2>{profile.full_name}</h2></div><button className="close-button" onClick={onClose}><X size={20} /></button></div>
@@ -3206,12 +3220,62 @@ function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profil
         <div className="team-divider" />
         <p className="eyebrow">Access</p>
         <div className="team-toggle-row"><div><strong>{profile.is_active ? 'Deactivate account' : 'Activate account'}</strong><span>{profile.is_active ? 'Prevent sign-in without deleting the account.' : 'Allow this member to sign in again.'}</span></div><button className="outline-button" onClick={() => onConfirm('toggle_active', !profile.is_active)}>{profile.is_active ? 'Deactivate' : 'Activate'}</button></div>
+        <div className="team-divider" />
+        <p className="eyebrow" style={{ color: '#99544a' }}>Danger Zone</p>
+        <div className="team-toggle-row" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+          <div>
+            <strong style={{ color: '#99544a' }}>Permanently delete account</strong>
+            <span>Remove employee and auth credentials. Historical leads and clients are safely preserved.</span>
+          </div>
+          <button
+            type="button"
+            className="outline-button"
+            style={{ borderColor: '#f43f5e', color: '#f43f5e' }}
+            onClick={() => onConfirm('delete_employee', '')}
+          >
+            Delete account
+          </button>
+        </div>
       </div>
     </section>
   </div>;
 }
 
-function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profile: Profile; action: 'set_role' | 'toggle_active'; newRole?: string; newActive?: boolean }; working: boolean; onCancel: () => void; onConfirm: () => void }) {
+function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profile: Profile; action: 'set_role' | 'toggle_active' | 'delete_employee'; newRole?: string; newActive?: boolean }; working: boolean; onCancel: () => void; onConfirm: () => void }) {
+  if (state.action === 'delete_employee') {
+    return (
+      <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+        <section className="confirm-dialog" style={{ maxWidth: 440 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, color: '#99544a' }}>
+            <AlertTriangle size={22} />
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Delete Employee Account</h3>
+          </div>
+          <p style={{ margin: '0 0 14px', fontSize: 13, lineHeight: 1.5, color: '#30342d' }}>
+            Are you sure you want to permanently delete <strong>{state.profile.full_name}</strong>?
+          </p>
+          <div style={{ background: '#f5f5f4', padding: '10px 12px', border: '1px solid #dadad2', marginBottom: 14, fontSize: 12 }}>
+            <div style={{ marginBottom: 4 }}><strong>Email:</strong> {state.profile.email}</div>
+            <div><strong>Role:</strong> {roleLabels[state.profile.role] ?? state.profile.role}</div>
+          </div>
+          <p style={{ margin: '0 0 16px', fontSize: 12, color: '#77796f', lineHeight: 1.4 }}>
+            This action cannot be undone. Authentication credentials and login access will be permanently removed. Assigned leads and clients will be safely unassigned or preserved.
+          </p>
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 14 }}>
+            <button className="outline-button" onClick={onCancel} disabled={working}>Cancel</button>
+            <button
+              className="lime-button"
+              style={{ background: '#f43f5e', color: '#fff', borderColor: '#e11d48' }}
+              onClick={onConfirm}
+              disabled={working}
+            >
+              {working ? 'Deleting…' : 'Delete permanently'}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   const text = state.action === 'set_role'
     ? `Change ${state.profile.full_name}'s role to ${roleLabels[state.newRole ?? ''] ?? state.newRole}?`
     : state.newActive
@@ -3251,7 +3315,10 @@ function AttendanceAdminPage({
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showManualModal, setShowManualModal] = useState(false);
 
-  const activeProfiles = useMemo(() => profiles.filter((p) => p.is_active), [profiles]);
+  // Exclude admin role completely from employee attendance listings and metrics
+  const employeeProfiles = useMemo(() => profiles.filter((p) => p.is_active && p.role !== 'admin'), [profiles]);
+  const employeeProfileIds = useMemo(() => new Set(employeeProfiles.map((p) => p.id)), [employeeProfiles]);
+  const employeeRecords = useMemo(() => records.filter((r) => employeeProfileIds.has(r.profile_id)), [records, employeeProfileIds]);
   const todayStr = useMemo(() => getTodayDateString(), []);
 
   const loadData = async () => {
@@ -3299,21 +3366,21 @@ function AttendanceAdminPage({
     setSelectedDate(`${y}-${m}-${day}`);
   };
 
-  // Metrics computation for selected date
+  // Metrics computation for selected date (strictly employee records, excluding admin)
   const metrics = useMemo(() => {
-    const totalActive = activeProfiles.length;
-    const checkedInCount = records.filter((r) => r.check_in_time).length;
-    const onTimeCount = records.filter((r) => r.status === 'present').length;
-    const lateCount = records.filter((r) => r.status === 'late').length;
-    const incompleteCount = records.filter((r) => r.check_in_time && !r.check_out_time).length;
+    const totalActive = employeeProfiles.length;
+    const checkedInCount = employeeRecords.filter((r) => r.check_in_time).length;
+    const onTimeCount = employeeRecords.filter((r) => r.status === 'present').length;
+    const lateCount = employeeRecords.filter((r) => r.status === 'late').length;
+    const incompleteCount = employeeRecords.filter((r) => r.check_in_time && !r.check_out_time).length;
     const absentCount = Math.max(0, totalActive - checkedInCount);
 
     return { totalActive, checkedInCount, onTimeCount, lateCount, incompleteCount, absentCount };
-  }, [activeProfiles, records]);
+  }, [employeeProfiles, employeeRecords]);
 
-  // Filtered rows
+  // Filtered rows (strictly employees, excluding admin)
   const filteredEmployees = useMemo(() => {
-    return activeProfiles.filter((emp) => {
+    return employeeProfiles.filter((emp) => {
       // Search filter
       const matchesSearch =
         !searchQuery.trim() ||
@@ -3324,7 +3391,7 @@ function AttendanceAdminPage({
       const matchesRole = roleFilter === 'all' || emp.role === roleFilter;
 
       // Status filter
-      const matchedRecord = records.find((r) => r.profile_id === emp.id);
+      const matchedRecord = employeeRecords.find((r) => r.profile_id === emp.id);
       let derivedStatus = 'absent';
       if (matchedRecord) {
         if (!matchedRecord.check_out_time && selectedDate < todayStr) {
@@ -3338,7 +3405,7 @@ function AttendanceAdminPage({
 
       return matchesSearch && matchesRole && matchesStatus;
     });
-  }, [activeProfiles, records, searchQuery, roleFilter, statusFilter, selectedDate, todayStr]);
+  }, [employeeProfiles, employeeRecords, searchQuery, roleFilter, statusFilter, selectedDate, todayStr]);
 
   return (
     <div className="page-content">
@@ -3437,7 +3504,6 @@ function AttendanceAdminPage({
             <option value="script_writer">Script Writer</option>
             <option value="social_media_manager">Social Media</option>
             <option value="finance">Finance</option>
-            <option value="admin">Admin</option>
             <option value="employee">Employee</option>
           </select>
         </div>
@@ -3538,7 +3604,7 @@ function AttendanceAdminPage({
             </thead>
             <tbody>
               {filteredEmployees.map((emp) => {
-                const rec = records.find((r) => r.profile_id === emp.id);
+                const rec = employeeRecords.find((r) => r.profile_id === emp.id);
 
                 let displayStatus = 'absent';
                 if (rec) {
@@ -3724,7 +3790,7 @@ function AttendanceAdminPage({
       {/* Manual Entry Modal */}
       {showManualModal && (
         <AttendanceManualEntryModal
-          profiles={activeProfiles}
+          profiles={employeeProfiles}
           defaultDate={selectedDate}
           onClose={() => setShowManualModal(false)}
           onSuccess={() => {
@@ -4157,7 +4223,11 @@ function AttendanceManualEntryModal({
   onClose: () => void;
   onSuccess: () => void;
 }) {
-  const [employeeId, setEmployeeId] = useState(profiles[0]?.id || '');
+  const selectableProfiles = useMemo(
+    () => profiles.filter((p) => p.is_active && p.role !== 'admin'),
+    [profiles]
+  );
+  const [employeeId, setEmployeeId] = useState(selectableProfiles[0]?.id || '');
   const [date, setDate] = useState(defaultDate);
   const [status, setStatus] = useState<AttendanceRecord['status']>('present');
   const [checkInTime, setCheckInTime] = useState('09:30');
@@ -4233,7 +4303,7 @@ function AttendanceManualEntryModal({
               onChange={(e) => setEmployeeId(e.target.value)}
               style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
             >
-              {profiles.map((p) => (
+              {selectableProfiles.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.full_name} ({p.role.split('_').join(' ')}) — {p.email}
                 </option>

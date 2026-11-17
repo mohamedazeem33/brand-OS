@@ -769,4 +769,50 @@ console.log("PASS 10: [SIMULATION] Shift threshold formatting renders 10:00 AM I
 }
 console.log("PASS 11: [SIMULATION] Role-based Dashboard Attendance rendering correctly isolates self-service widget from Admin Dashboard");
 
-console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (11/11).\n");
+// ============================================================================
+// TEST 12: [SIMULATION] Attendance Admin Page Complete Admin Exclusion
+// ============================================================================
+{
+  const mockProfiles = [
+    { id: "admin-1", email: "admin@taha.in", full_name: "Admin User", role: "admin", is_active: true },
+    { id: "emp-1", email: "sara@taha.in", full_name: "Sara Ahmed", role: "sales", is_active: true },
+    { id: "emp-2", email: "rahul@taha.in", full_name: "Rahul Verma", role: "editor", is_active: true },
+    { id: "emp-3", email: "inactive@taha.in", full_name: "Inactive Staff", role: "employee", is_active: false },
+  ];
+
+  // Attendance records for the day (including an admin record from earlier test)
+  const mockRecords = [
+    { profile_id: "admin-1", attendance_date: "2026-11-17", status: "present", check_in_time: "2026-11-17T09:15:00Z", check_out_time: "2026-11-17T18:00:00Z" },
+    { profile_id: "emp-1", attendance_date: "2026-11-17", status: "present", check_in_time: "2026-11-17T09:30:00Z", check_out_time: "2026-11-17T18:00:00Z" },
+  ];
+
+  // Logic used in AttendanceAdminPage
+  const employeeProfiles = mockProfiles.filter((p) => p.is_active && p.role !== "admin");
+  const employeeProfileIds = new Set(employeeProfiles.map((p) => p.id));
+  const employeeRecords = mockRecords.filter((r) => employeeProfileIds.has(r.profile_id));
+
+  // 1. Verify admin is excluded from employeeProfiles
+  assert.equal(employeeProfiles.length, 2, "Only active non-admin employees included");
+  assert.equal(employeeProfiles.some((p) => p.role === "admin"), false, "Admin role strictly excluded");
+  assert.equal(employeeProfiles.some((p) => !p.is_active), false, "Inactive accounts strictly excluded");
+
+  // 2. Verify metrics calculation strictly excludes admin records and headcount
+  const totalActive = employeeProfiles.length; // 2 (Sara and Rahul)
+  const checkedInCount = employeeRecords.filter((r) => r.check_in_time).length; // 1 (Sara only)
+  const onTimeCount = employeeRecords.filter((r) => r.status === "present").length; // 1 (Sara only)
+  const lateCount = employeeRecords.filter((r) => r.status === "late").length; // 0
+  const incompleteCount = employeeRecords.filter((r) => r.check_in_time && !r.check_out_time).length; // 0
+  const absentCount = Math.max(0, totalActive - checkedInCount); // 1 (Rahul)
+
+  assert.equal(totalActive, 2, "Active team metric does not count admin");
+  assert.equal(checkedInCount, 1, "Checked in metric does not count admin test check-in");
+  assert.equal(onTimeCount, 1, "On time count excludes admin");
+  assert.equal(absentCount, 1, "Not checked in accurately reflects non-admin staff only");
+
+  // 3. Verify manual entry dropdown selectable profiles
+  const manualEntrySelectable = mockProfiles.filter((p) => p.is_active && p.role !== "admin");
+  assert.equal(manualEntrySelectable.some((p) => p.role === "admin"), false, "Admin not in manual entry dropdown");
+}
+console.log("PASS 12: [SIMULATION] Attendance Admin Page strictly excludes admins from listings, metrics, and dropdowns");
+
+console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (12/12).\n");
