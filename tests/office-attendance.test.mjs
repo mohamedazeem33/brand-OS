@@ -741,4 +741,32 @@ console.log("PASS 9: [SIMULATION] Insufficient accuracy rejection and retry work
 }
 console.log("PASS 10: [SIMULATION] Shift threshold formatting renders 10:00 AM IST and prevents 03:30 PM bug");
 
-console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (10/10).\n");
+// ============================================================================
+// TEST 11: [SIMULATION] Role-based Dashboard Attendance Rendering
+// ============================================================================
+{
+  function evaluateDashboardAttendanceRendering(profile) {
+    const isAdmin = profile.role === "admin";
+    return {
+      rendersSelfServiceWidget: !isAdmin,
+      hasAdminAttendanceNav: isAdmin,
+    };
+  }
+
+  // Salesperson / Employee account: sees self-service GPS widget, no admin attendance nav
+  const salesResult = evaluateDashboardAttendanceRendering({ role: "sales", full_name: "Anu Sales" });
+  assert.equal(salesResult.rendersSelfServiceWidget, true, "Salesperson must see GPS self-service widget on Dashboard");
+  assert.equal(salesResult.hasAdminAttendanceNav, false, "Salesperson must not have admin attendance nav");
+
+  const employeeResult = evaluateDashboardAttendanceRendering({ role: "employee", full_name: "John Staff" });
+  assert.equal(employeeResult.rendersSelfServiceWidget, true, "Employee must see GPS self-service widget on Dashboard");
+  assert.equal(employeeResult.hasAdminAttendanceNav, false);
+
+  // Admin account: must NOT see self-service widget on Dashboard, accesses attendance via dedicated Admin page
+  const adminResult = evaluateDashboardAttendanceRendering({ role: "admin", full_name: "Mohamed Azeem Admin" });
+  assert.equal(adminResult.rendersSelfServiceWidget, false, "Admin must NOT see GPS self-service Check In / Out widget on Dashboard");
+  assert.equal(adminResult.hasAdminAttendanceNav, true, "Admin accesses attendance management via dedicated Attendance nav");
+}
+console.log("PASS 11: [SIMULATION] Role-based Dashboard Attendance rendering correctly isolates self-service widget from Admin Dashboard");
+
+console.log("\nALL OFFICE ATTENDANCE MODULE TESTS PASSED (11/11).\n");

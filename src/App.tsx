@@ -1409,8 +1409,8 @@ function Dashboard({
       ))}
     </section>
 
-    {/* Office GPS Attendance Widget */}
-    <DashboardAttendanceWidget profile={profile} />
+    {/* Office GPS Attendance Widget (Self-service for employees and salespeople) */}
+    {!isAdmin && <DashboardAttendanceWidget profile={profile} />}
 
     <div className="dashboard-grid">
       <section className="panel activity-panel">
