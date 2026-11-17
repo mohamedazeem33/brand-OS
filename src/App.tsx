@@ -3074,7 +3074,7 @@ const roleLabels: Record<string, string> = Object.fromEntries(teamRoles.map((r) 
 
 async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active' | 'delete_employee', payload: Record<string, unknown>) {
   const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.access_token) throw new Error('You are not signed in.');
+  if (!session?.access_token) throw new Error('You are not signed in. Please sign in to continue.');
   const method = action === 'create' ? 'POST' : action === 'delete_employee' ? 'DELETE' : 'PATCH';
   const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/team-admin`, {
     method,
@@ -3086,8 +3086,17 @@ async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active' | '
     body: JSON.stringify(action === 'create' ? payload : { action, ...payload }),
   });
   if (!response.ok) {
-    let message = 'Something went wrong.';
-    try { const body = await response.json(); if (body?.error) message = body.error; } catch { /* ignore */ }
+    let message = `Request failed (${response.status} ${response.statusText || 'Error'}).`;
+    try {
+      const body = await response.json();
+      if (body?.error) message = body.error;
+      else if (body?.message) message = body.message;
+    } catch {
+      try {
+        const text = await response.text();
+        if (text && text.length < 200) message = text;
+      } catch { /* ignore */ }
+    }
     throw new Error(message);
   }
   return (await response.json()) as { method?: 'invite' | 'temp_password'; temp_password?: string; success?: boolean; message?: string };
@@ -3097,7 +3106,9 @@ function TeamPage({ profile }: { profile: Profile }) {
   const isAdmin = profile.role === 'admin';
   const [employees, setEmployees] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [actionSuccess, setActionSuccess] = useState('');
   const [query, setQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState('All roles');
   const [statusFilter, setStatusFilter] = useState('All status');
@@ -3107,9 +3118,9 @@ function TeamPage({ profile }: { profile: Profile }) {
   const [working, setWorking] = useState(false);
 
   const loadEmployees = async () => {
-    setLoading(true); setError('');
+    setLoading(true); setLoadError('');
     const { data, error: err } = await supabase.from('profiles').select('id, email, full_name, role, is_active').order('full_name');
-    if (err) setError(friendlyError());
+    if (err) setLoadError(friendlyError());
     else setEmployees((data ?? []) as Profile[]);
     setLoading(false);
   };
@@ -3124,18 +3135,23 @@ function TeamPage({ profile }: { profile: Profile }) {
   const runAction = async () => {
     if (!confirmState) return;
     setWorking(true);
+    setActionError('');
+    setActionSuccess('');
     try {
       if (confirmState.action === 'set_role' && confirmState.newRole) {
         await callTeamAdmin('set_role', { user_id: confirmState.profile.id, role: confirmState.newRole });
+        setActionSuccess(`Role for ${confirmState.profile.full_name} updated successfully.`);
       } else if (confirmState.action === 'toggle_active') {
-        await callTeamAdmin('toggle_active', { user_id: confirmState.profile.id, is_active: confirmState.newActive ?? false });
+        const res = await callTeamAdmin('toggle_active', { user_id: confirmState.profile.id, is_active: confirmState.newActive ?? false });
+        setActionSuccess(res?.message || (confirmState.newActive ? `Account for ${confirmState.profile.full_name} activated successfully.` : `Account for ${confirmState.profile.full_name} deactivated successfully.`));
       } else if (confirmState.action === 'delete_employee') {
-        await callTeamAdmin('delete_employee', { user_id: confirmState.profile.id });
+        const res = await callTeamAdmin('delete_employee', { user_id: confirmState.profile.id });
+        setActionSuccess(res?.message || `Account for ${confirmState.profile.full_name} permanently deleted.`);
       }
       setConfirmState(null);
       await loadEmployees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : friendlyError());
+      setActionError(e instanceof Error ? e.message : 'An unexpected error occurred while processing the request.');
     } finally {
       setWorking(false);
     }
@@ -3144,17 +3160,36 @@ function TeamPage({ profile }: { profile: Profile }) {
   return <div className="page-content">
     <div className="page-title-row leads-title"><div><p className="eyebrow">Team / {employees.length.toString().padStart(2, '0')} members</p><h1>Team management</h1><p className="subtitle">Every workspace member, clearly accounted for.</p></div>{isAdmin && <button className="lime-button" onClick={() => setShowAdd(true)}><UserPlus size={18} /> Add employee</button>}</div>
     <div className="filter-bar"><div className="search-box"><Search size={18} /><input placeholder="Search team members" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="filter-select"><Filter size={16} /><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option>All roles</option>{teamRoles.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}</select></div><div className="filter-select"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option>All status</option><option>Active</option><option>Inactive</option></select></div></div>
-    {error && <div className="data-state"><CircleAlert size={22} /><h3>Something went wrong</h3><p>{error}</p><button className="outline-button" onClick={() => { setError(''); loadEmployees(); }}>Try again</button></div>}
-    {!error && loading ? <div className="data-state"><div className="spinner" /><p>Loading team members…</p></div>
-     : !error && filtered.length === 0 ? <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>No team members found</h3><p>Adjust your search or add a new employee.</p></div>
-     : !error && <div className="lead-table-wrap"><table className="lead-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>
+    {actionError && (
+      <div className="attendance-alert error" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, color: '#991b1b', fontSize: 13 }}>
+        <CircleAlert size={16} />
+        <div style={{ flex: 1 }}><strong>Action failed:</strong> {actionError}</div>
+        <button type="button" onClick={() => setActionError('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#991b1b', fontSize: 18, lineHeight: 1 }}>&times;</button>
+      </div>
+    )}
+    {actionSuccess && (
+      <div className="attendance-alert success" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, color: '#166534', fontSize: 13 }}>
+        <CheckCircle2 size={16} />
+        <div style={{ flex: 1 }}>{actionSuccess}</div>
+        <button type="button" onClick={() => setActionSuccess('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#166534', fontSize: 18, lineHeight: 1 }}>&times;</button>
+      </div>
+    )}
+    {loadError && employees.length === 0 ? (
+      <div className="data-state"><CircleAlert size={22} /><h3>Something went wrong</h3><p>{loadError}</p><button className="outline-button" onClick={() => { setLoadError(''); loadEmployees(); }}>Try again</button></div>
+    ) : !loadError && loading && employees.length === 0 ? (
+      <div className="data-state"><div className="spinner" /><p>Loading team members…</p></div>
+    ) : !loadError && filtered.length === 0 ? (
+      <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>No team members found</h3><p>Adjust your search or add a new employee.</p></div>
+    ) : (
+      <div className="lead-table-wrap"><table className="lead-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>
       {filtered.map((e) => <tr key={e.id}><td><div className="table-person"><div className="small-avatar" style={{ opacity: e.is_active ? 1 : 0.45 }}>{e.full_name.slice(0, 1).toUpperCase()}</div><div><strong>{e.full_name}</strong><span>{e.email}</span></div></div></td>
         <td><span className={`team-role-pill ${e.role}`}>{e.role === 'admin' ? 'Admin' : roleLabels[e.role] ?? e.role}</span></td>
         <td><span className={`active-pill ${e.is_active ? 'on' : 'off'}`}><span className="active-dot" />{e.is_active ? 'Active' : 'Inactive'}</span></td>
         <td><span className="muted">Team member</span></td>
         <td>{isAdmin && e.role !== 'admin' ? <button className="row-action" aria-label={`Manage ${e.full_name}`} onClick={() => setActionRow(e)}><MoreHorizontal size={18} /></button> : <span className="muted">—</span>}</td>
       </tr>)}
-    </tbody></table></div>}
+    </tbody></table></div>
+    )}
     {showAdd && isAdmin && <AddEmployeeModal onClose={() => setShowAdd(false)} onCreated={async () => { setShowAdd(false); await loadEmployees(); }} />}
     {actionRow && isAdmin && <EmployeeActionDrawer profile={actionRow} onClose={() => setActionRow(null)} onConfirm={(action, value) => { setActionRow(null); setConfirmState({ profile: actionRow, action, newRole: action === 'set_role' ? (value as string) : undefined, newActive: action === 'toggle_active' ? Boolean(value) : undefined }); }} />}
     {confirmState && <ConfirmDialog state={confirmState} working={working} onCancel={() => setConfirmState(null)} onConfirm={runAction} />}

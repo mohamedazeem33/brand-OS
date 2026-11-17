@@ -850,9 +850,12 @@ Deno.serve(async (req: Request) => {
         return json({ success: true });
       }
 
-      // Toggle active
-      if (body.action === "toggle_active") {
-        const nextActive = !!body.is_active;
+      // Toggle active status (accepts both "toggle_active" and "set_active" action aliases)
+      if (body.action === "toggle_active" || body.action === "set_active") {
+        if (typeof body.is_active !== "boolean" && body.is_active !== "true" && body.is_active !== "false") {
+          return errorResponse("is_active must be provided as a boolean (true or false).", 400);
+        }
+        const nextActive = body.is_active === true || body.is_active === "true";
 
         // Prevent deactivating your own account (lockout guard)
         if (!nextActive && userId === admin.id) {
@@ -878,7 +881,7 @@ Deno.serve(async (req: Request) => {
 
         if (authBanError) {
           console.error("Auth admin updateUserById ban toggle failed:", userId, authBanError.message);
-          return errorResponse(`Could not update authentication status: ${authBanError.message}`, 500);
+          return errorResponse(`Could not update authentication ban status: ${authBanError.message}`, 500);
         }
 
         const { error: profileError } = await supabase
@@ -887,16 +890,27 @@ Deno.serve(async (req: Request) => {
           .eq("id", userId);
 
         if (profileError) {
-          // Attempt rollback of auth ban
-          await supabase.auth.admin.updateUserById(userId, {
+          console.error("Profile update failed during toggle_active:", userId, profileError.message);
+          // Rollback of auth ban to keep state synchronized
+          const { error: rollbackErr } = await supabase.auth.admin.updateUserById(userId, {
             ban_duration: nextActive ? "876000h" : "none",
           });
-          return errorResponse("Could not update the account status.", 500);
+          if (rollbackErr) {
+            console.error("Auth ban rollback also failed:", userId, rollbackErr.message);
+            return errorResponse(
+              `Failed to update profile (${profileError.message}) and failed to rollback auth status (${rollbackErr.message}).`,
+              500
+            );
+          }
+          return errorResponse(`Could not update the account profile status: ${profileError.message}`, 500);
         }
 
         return json({
           success: true,
-          message: nextActive ? "Account activated successfully." : "Account deactivated successfully.",
+          is_active: nextActive,
+          message: nextActive
+            ? `Account for ${target.full_name || target.email} activated successfully.`
+            : `Account for ${target.full_name || target.email} deactivated successfully. Login access has been suspended.`,
         });
       }
 
