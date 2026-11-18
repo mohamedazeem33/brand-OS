@@ -587,9 +587,19 @@ function Workspace({
   };
 
   const convertLead = async (leadId: string, leadForm: LeadForm, clientData: { company_name: string }) => {
-    const { data: existing } = await supabase.from('clients').select('id').eq('lead_id', leadId).maybeSingle();
-    if (existing) throw new Error('This lead has already been converted to a client.');
+    const { data: existing, error: existingErr } = await supabase.from('clients').select('id').eq('lead_id', leadId).maybeSingle();
+    if (existingErr) throw new Error(friendlyError());
     const assignedTo = isAdmin ? leadForm.assigned_to : profile.id;
+    const leadPayload = { ...leadForm, email: leadForm.email || null, service: leadForm.service || 'Not specified', assigned_to: assignedTo, status: 'converted' as const };
+    if (existing) {
+      // Idempotently restore the lead's Converted status without creating a duplicate client.
+      const { error: restoreErr } = await supabase.from('leads').update(leadPayload).eq('id', leadId);
+      if (restoreErr) throw new Error(friendlyError());
+      await loadData();
+      setSelectedLead(null);
+      setShowAdd(false);
+      return;
+    }
     const clientPayload = {
       name: leadForm.name,
       company_name: clientData.company_name || null,
@@ -604,7 +614,6 @@ function Workspace({
     };
     const { data: client, error: clientErr } = await supabase.from('clients').insert(clientPayload).select().maybeSingle();
     if (clientErr || !client) throw new Error(friendlyError());
-    const leadPayload = { ...leadForm, email: leadForm.email || null, service: leadForm.service || 'Not specified', assigned_to: assignedTo };
     const { error: leadErr } = await supabase.from('leads').update(leadPayload).eq('id', leadId);
     if (leadErr) throw new Error(friendlyError());
     await loadData();
@@ -702,6 +711,7 @@ function Workspace({
     {selectedLead && (
       <LeadDetail
         lead={selectedLead}
+        hasLinkedClient={clients.some((client) => client.lead_id === selectedLead.id)}
         profiles={profiles}
         profile={profile}
         callLogs={callLogs}
@@ -1998,6 +2008,7 @@ function DeletedLeadDetail({
   onRestore,
 }: {
   lead: Lead;
+  hasLinkedClient?: boolean;
   profiles: Profile[];
   onClose: () => void;
   onRestore: (id: string) => Promise<void>;
@@ -2123,6 +2134,7 @@ function LeadModal({ profiles, profile, onClose, onSave }: { profiles: Profile[]
 
 function LeadDetail({
   lead,
+  hasLinkedClient = false,
   profiles,
   profile,
   callLogs = [],
@@ -2162,6 +2174,7 @@ function LeadDetail({
     profile={profile}
     initial={initial}
     lead={lead}
+    hasLinkedClient={hasLinkedClient}
     callLogs={callLogs}
     loadingLogs={loadingLogs}
     onClose={onClose}
@@ -2179,6 +2192,7 @@ function LeadEditor({
   profile,
   initial,
   lead,
+  hasLinkedClient = false,
   callLogs = [],
   loadingLogs = false,
   onClose,
@@ -2193,6 +2207,7 @@ function LeadEditor({
   profile: Profile;
   initial: LeadForm;
   lead?: Lead;
+  hasLinkedClient?: boolean;
   callLogs?: LeadCallLog[];
   loadingLogs?: boolean;
   onClose: () => void;
@@ -2226,7 +2241,7 @@ function LeadEditor({
     setError('');
     // Lock source to 'Meta Ads' if received from Meta
     const formToSubmit = isMetaLead ? { ...form, source: 'Meta Ads' as const } : form;
-    if (detail && initial.status !== 'converted' && formToSubmit.status === 'converted' && onConvert) {
+    if (detail && !hasLinkedClient && initial.status !== 'converted' && formToSubmit.status === 'converted' && onConvert) {
       setShowConvertConfirm(true);
       setSaving(false);
       return;
