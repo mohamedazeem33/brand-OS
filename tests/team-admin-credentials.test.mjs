@@ -394,4 +394,279 @@ const targetUserId = "e83ba695-c953-4946-86db-7ad5ed537f4d";
   console.log("PASS: Zero password exposure in response objects");
 }
 
-console.log("\nALL TEAM-ADMIN CREDENTIALS TESTS PASSED (8/8).\n");
+// 9. Deactivation & Reactivation Simulation (Auth Ban, Profile Active State, Rollback & Action Aliases)
+{
+  function handleToggleActive({
+    caller,
+    targetUserId,
+    body,
+    profilesDb,
+    authUsersDb,
+    simulateAuthError = false,
+    simulateProfileError = false,
+  }) {
+    if (!caller || caller.role !== "admin" || !caller.is_active) {
+      return { status: 403, error: "Admin access required." };
+    }
+    const target = profilesDb.find((p) => p.id === targetUserId);
+    if (!target) return { status: 404, error: "Employee not found." };
+
+    const action = body?.action;
+    if (action !== "toggle_active" && action !== "set_active") {
+      return { status: 400, error: "Unknown action." };
+    }
+
+    if (typeof body?.is_active !== "boolean" && body?.is_active !== "true" && body?.is_active !== "false") {
+      return { status: 400, error: "is_active must be provided as a boolean (true or false)." };
+    }
+    const nextActive = body.is_active === true || body.is_active === "true";
+
+    if (!nextActive && targetUserId === caller.id) {
+      return { status: 400, error: "You cannot deactivate your own account." };
+    }
+
+    if (!nextActive && target.role === "admin") {
+      const activeAdminCount = profilesDb.filter((p) => p.role === "admin" && p.is_active).length;
+      if (activeAdminCount <= 1) {
+        return { status: 400, error: "Cannot deactivate the last active admin." };
+      }
+    }
+
+    // Step 1: Auth Admin ban/unban
+    if (simulateAuthError) {
+      return { status: 500, error: "Could not update authentication ban status: Auth service unavailable" };
+    }
+
+    const authUser = authUsersDb.find((u) => u.id === targetUserId);
+    const prevBanDuration = authUser ? authUser.ban_duration : "none";
+    if (authUser) {
+      authUser.banned_until = nextActive ? null : "2126-11-17T00:00:00Z";
+      authUser.ban_duration = nextActive ? "none" : "876000h";
+    }
+
+    // Step 2: Update public.profiles
+    if (simulateProfileError) {
+      // Rollback Auth ban to preserve consistency
+      if (authUser) {
+        authUser.ban_duration = prevBanDuration;
+        authUser.banned_until = prevBanDuration === "876000h" ? "2126-11-17T00:00:00Z" : null;
+      }
+      return { status: 500, error: "Could not update the account profile status: Database write conflict" };
+    }
+
+    target.is_active = nextActive;
+    return {
+      status: 200,
+      body: {
+        success: true,
+        is_active: nextActive,
+        message: nextActive
+          ? `Account for ${target.full_name || target.email} activated successfully.`
+          : `Account for ${target.full_name || target.email} deactivated successfully. Login access has been suspended.`,
+      },
+    };
+  }
+
+  const profilesDb = [
+    { id: "admin-1", email: "admin@taha.in", full_name: "Admin User", role: "admin", is_active: true },
+    { id: "emp-1", email: "sales@taha.in", full_name: "Sales User", role: "sales", is_active: true },
+  ];
+  const authUsersDb = [
+    { id: "admin-1", email: "admin@taha.in", ban_duration: "none", banned_until: null },
+    { id: "emp-1", email: "sales@taha.in", ban_duration: "none", banned_until: null },
+  ];
+
+  // 1. Lockout guard: Admin cannot deactivate self
+  const selfDeact = handleToggleActive({ caller: profilesDb[0], targetUserId: "admin-1", body: { action: "toggle_active", is_active: false }, profilesDb, authUsersDb });
+  assert.equal(selfDeact.status, 400);
+  assert.equal(selfDeact.error, "You cannot deactivate your own account.");
+
+  // 2. Last active admin guard
+  const lastAdminDeact = handleToggleActive({ caller: { ...profilesDb[0], id: "other-admin" }, targetUserId: "admin-1", body: { action: "toggle_active", is_active: false }, profilesDb, authUsersDb });
+  assert.equal(lastAdminDeact.status, 400);
+  assert.equal(lastAdminDeact.error, "Cannot deactivate the last active admin.");
+
+  // 3. Action alias compatibility: "set_active" works identically to "toggle_active"
+  const aliasDeact = handleToggleActive({ caller: profilesDb[0], targetUserId: "emp-1", body: { action: "set_active", is_active: false }, profilesDb, authUsersDb });
+  assert.equal(aliasDeact.status, 200);
+  assert.match(aliasDeact.body.message, /deactivated successfully/i);
+
+  // Reset state
+  profilesDb[1].is_active = true;
+  authUsersDb[1].ban_duration = "none";
+  authUsersDb[1].banned_until = null;
+
+  // 4. Failed Auth Banning: Fail-closed; profile must NOT be updated
+  const failedAuthRes = handleToggleActive({
+    caller: profilesDb[0],
+    targetUserId: "emp-1",
+    body: { action: "toggle_active", is_active: false },
+    profilesDb,
+    authUsersDb,
+    simulateAuthError: true,
+  });
+  assert.equal(failedAuthRes.status, 500);
+  assert.match(failedAuthRes.error, /Could not update authentication ban status/);
+  assert.equal(profilesDb[1].is_active, true, "Profile remains active when Auth ban fails");
+  assert.equal(authUsersDb[1].ban_duration, "none", "Auth ban was not applied");
+
+  // 5. Failed Profile Update: Triggers Auth ban rollback to 'none'
+  const failedProfileRes = handleToggleActive({
+    caller: profilesDb[0],
+    targetUserId: "emp-1",
+    body: { action: "toggle_active", is_active: false },
+    profilesDb,
+    authUsersDb,
+    simulateProfileError: true,
+  });
+  assert.equal(failedProfileRes.status, 500);
+  assert.match(failedProfileRes.error, /Could not update the account profile status/);
+  assert.equal(profilesDb[1].is_active, true, "Profile remains unchanged after failure");
+  assert.equal(authUsersDb[1].ban_duration, "none", "Auth ban rolled back to 'none'");
+
+  // 6. Successful deactivation: updates profiles.is_active AND applies Auth ban
+  const empDeact = handleToggleActive({ caller: profilesDb[0], targetUserId: "emp-1", body: { action: "toggle_active", is_active: false }, profilesDb, authUsersDb });
+  assert.equal(empDeact.status, 200);
+  assert.match(empDeact.body.message, /Account for Sales User deactivated successfully/);
+  assert.equal(profilesDb[1].is_active, false);
+  assert.equal(authUsersDb[1].ban_duration, "876000h");
+  assert.notEqual(authUsersDb[1].banned_until, null);
+
+  // 7. Successful reactivation: updates profiles.is_active AND clears Auth ban
+  const empReact = handleToggleActive({ caller: profilesDb[0], targetUserId: "emp-1", body: { action: "toggle_active", is_active: true }, profilesDb, authUsersDb });
+  assert.equal(empReact.status, 200);
+  assert.match(empReact.body.message, /Account for Sales User activated successfully/);
+  assert.equal(profilesDb[1].is_active, true);
+  assert.equal(authUsersDb[1].ban_duration, "none");
+  assert.equal(authUsersDb[1].banned_until, null);
+
+  console.log("PASS: Deactivation and reactivation regression tests pass (Auth ban, rollback, and action aliases)");
+}
+
+// 10. Permanent Employee Deletion Simulation (Safeguards & Business Records Preservation)
+{
+  function handleDeleteEmployee({ caller, targetUserId, profilesDb, authUsersDb, leadsDb, clientsDb, callLogsDb }) {
+    if (!caller || caller.role !== "admin" || !caller.is_active) {
+      return { status: 403, error: "Admin access required." };
+    }
+    const target = profilesDb.find((p) => p.id === targetUserId);
+    if (!target) return { status: 404, error: "Employee not found." };
+
+    if (targetUserId === caller.id) {
+      return { status: 400, error: "You cannot delete your own account." };
+    }
+
+    if (target.role === "admin") {
+      return { status: 400, error: "Admin accounts cannot be deleted through this interface." };
+    }
+
+    // Preserve business records:
+    leadsDb.forEach((lead) => {
+      if (lead.assigned_to === targetUserId) lead.assigned_to = null;
+      if (lead.created_by === targetUserId) lead.created_by = caller.id;
+    });
+
+    clientsDb.forEach((client) => {
+      if (client.assigned_to === targetUserId) client.assigned_to = null;
+      if (client.created_by === targetUserId) client.created_by = caller.id;
+    });
+
+    callLogsDb.forEach((log) => {
+      if (log.salesperson_id === targetUserId) log.salesperson_id = caller.id;
+    });
+
+    // Remove from auth and profiles
+    const authIdx = authUsersDb.findIndex((u) => u.id === targetUserId);
+    if (authIdx !== -1) authUsersDb.splice(authIdx, 1);
+
+    const profIdx = profilesDb.findIndex((p) => p.id === targetUserId);
+    if (profIdx !== -1) profilesDb.splice(profIdx, 1);
+
+    return {
+      status: 200,
+      body: {
+        success: true,
+        message: `Employee ${target.full_name || target.email} permanently deleted. All business records have been preserved.`,
+      },
+    };
+  }
+
+  const profilesDb = [
+    { id: "admin-1", email: "admin@taha.in", full_name: "Admin User", role: "admin", is_active: true },
+    { id: "admin-2", email: "admin2@taha.in", full_name: "Second Admin", role: "admin", is_active: true },
+    { id: "emp-1", email: "sales@taha.in", full_name: "Sales User", role: "sales", is_active: true },
+  ];
+  const authUsersDb = [
+    { id: "admin-1", email: "admin@taha.in" },
+    { id: "admin-2", email: "admin2@taha.in" },
+    { id: "emp-1", email: "sales@taha.in" },
+  ];
+  const leadsDb = [
+    { id: "lead-1", name: "Client A", assigned_to: "emp-1", created_by: "emp-1" },
+  ];
+  const clientsDb = [
+    { id: "client-1", name: "Client Corp", assigned_to: "emp-1", created_by: "emp-1" },
+  ];
+  const callLogsDb = [
+    { id: "log-1", salesperson_id: "emp-1", call_outcome: "interested" },
+  ];
+
+  // 1. Self deletion rejection
+  const selfDel = handleDeleteEmployee({ caller: profilesDb[0], targetUserId: "admin-1", profilesDb, authUsersDb, leadsDb, clientsDb, callLogsDb });
+  assert.equal(selfDel.status, 400);
+  assert.equal(selfDel.error, "You cannot delete your own account.");
+
+  // 2. Admin deletion rejection
+  const adminDel = handleDeleteEmployee({ caller: profilesDb[0], targetUserId: "admin-2", profilesDb, authUsersDb, leadsDb, clientsDb, callLogsDb });
+  assert.equal(adminDel.status, 400);
+  assert.equal(adminDel.error, "Admin accounts cannot be deleted through this interface.");
+
+  // 3. Successful employee deletion with record preservation
+  const empDel = handleDeleteEmployee({ caller: profilesDb[0], targetUserId: "emp-1", profilesDb, authUsersDb, leadsDb, clientsDb, callLogsDb });
+  assert.equal(empDel.status, 200);
+  assert.equal(empDel.body.success, true);
+  assert.match(empDel.body.message, /Sales User permanently deleted/);
+
+  // Target removed from profiles and auth
+  assert.equal(profilesDb.some((p) => p.id === "emp-1"), false);
+  assert.equal(authUsersDb.some((u) => u.id === "emp-1"), false);
+
+  // Business records preserved
+  assert.equal(leadsDb[0].assigned_to, null, "Assigned lead unassigned safely");
+  assert.equal(leadsDb[0].created_by, "admin-1", "Lead created_by reassigned to deleting admin");
+  assert.equal(clientsDb[0].assigned_to, null, "Assigned client unassigned safely");
+  assert.equal(clientsDb[0].created_by, "admin-1", "Client created_by reassigned to deleting admin");
+  assert.equal(callLogsDb[0].salesperson_id, "admin-1", "Call log salesperson reassigned to admin");
+
+  console.log("PASS: Permanent employee deletion enforces safeguards and preserves business records");
+}
+
+// 11. Meaningful Backend Error Message Parsing (No Generic "Something went wrong")
+{
+  function parseBackendError(status, statusText, bodyJson, bodyText) {
+    let message = `Request failed (${status} ${statusText || 'Error'}).`;
+    if (bodyJson && typeof bodyJson === "object") {
+      if (bodyJson.error) message = bodyJson.error;
+      else if (bodyJson.message) message = bodyJson.message;
+    } else if (bodyText && bodyText.trim().length > 0 && bodyText.length < 200) {
+      message = bodyText.trim();
+    }
+    return message;
+  }
+
+  // 1. Standard backend error response { error: "..." }
+  const err1 = parseBackendError(400, "Bad Request", { error: "Cannot deactivate the last active admin." });
+  assert.equal(err1, "Cannot deactivate the last active admin.");
+
+  // 2. Auth failure response { error: "..." }
+  const err2 = parseBackendError(500, "Internal Server Error", { error: "Could not update authentication ban status: Auth rate limit" });
+  assert.equal(err2, "Could not update authentication ban status: Auth rate limit");
+
+  // 3. Fallback response with status code
+  const err3 = parseBackendError(502, "Bad Gateway", null, "");
+  assert.equal(err3, "Request failed (502 Bad Gateway).");
+
+  console.log("PASS: Client error parser extracts exact backend error message without generic replacement");
+}
+
+console.log("\nALL TEAM-ADMIN CREDENTIALS TESTS PASSED (11/11).\n");

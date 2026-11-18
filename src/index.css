@@ -1119,3 +1119,474 @@ button { cursor: pointer; }
   line-height: 1.5;
 }
 
+/* ==========================================================================
+   OFFICE GPS ATTENDANCE MODULE STYLES
+   ========================================================================== */
+
+.attendance-widget-card {
+  background: #ffffff;
+  border: 1px solid #dadad2;
+  border-radius: 4px;
+  padding: 24px 28px;
+  margin-bottom: 30px;
+}
+
+.attendance-widget-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #eef0ea;
+}
+
+.attendance-widget-title-group h2 {
+  margin: 4px 0 6px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: #20221d;
+}
+
+.attendance-widget-title-group p {
+  margin: 0;
+  font-size: 12px;
+  color: #77796f;
+  line-height: 1.5;
+}
+
+.attendance-widget-body {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr;
+  gap: 24px;
+  align-items: center;
+}
+
+@media (max-width: 860px) {
+  .attendance-widget-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.attendance-status-box {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 20px;
+  background: #fbfcf8;
+  border: 1px solid #e5e9df;
+  border-radius: 8px;
+}
+
+.attendance-status-icon-wrap {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #eef0e9;
+  color: #515850;
+  flex-shrink: 0;
+}
+
+.attendance-status-icon-wrap.active {
+  background: #c3f05a;
+  color: #20221d;
+}
+
+.attendance-status-icon-wrap.late {
+  background: #fff1dd;
+  color: #986a30;
+}
+
+.attendance-status-icon-wrap.done {
+  background: #e1f1e3;
+  color: #43724e;
+}
+
+.attendance-status-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.attendance-status-details strong {
+  display: block;
+  font-size: 15px;
+  color: #20221d;
+  font-weight: 700;
+}
+
+.attendance-status-details span {
+  display: block;
+  font-size: 12px;
+  color: #687064;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.attendance-actions-group {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.attendance-btn-checkin {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #c3f05a;
+  color: #20221d;
+  border: none;
+  padding: 12px 22px;
+  font-size: 13px;
+  font-weight: 800;
+  border-radius: 4px;
+  transition: transform .15s, background .15s;
+}
+
+.attendance-btn-checkin:hover:not(:disabled) {
+  background: #b5e94a;
+  transform: translateY(-1px);
+}
+
+.attendance-btn-checkout {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #20221d;
+  color: #f2f4ed;
+  border: none;
+  padding: 12px 22px;
+  font-size: 13px;
+  font-weight: 700;
+  border-radius: 4px;
+  transition: transform .15s, background .15s;
+}
+
+.attendance-btn-checkout:hover:not(:disabled) {
+  background: #33382e;
+  transform: translateY(-1px);
+}
+
+.attendance-btn-checkin:disabled,
+.attendance-btn-checkout:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.attendance-alert {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.attendance-alert.error {
+  background: #fdf2f0;
+  border: 1px solid #f2cfc9;
+  color: #99544a;
+}
+
+.attendance-alert.success {
+  background: #f3faf2;
+  border: 1px solid #cfead0;
+  color: #3b6b44;
+}
+
+.attendance-alert.info {
+  background: #f5f8fa;
+  border: 1px solid #d5e5ed;
+  color: #3d6074;
+}
+
+/* Status pills for attendance */
+.att-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  font: 10px 'DM Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.att-pill.present {
+  background: #eff9d6;
+  color: #4b6319;
+}
+
+.att-pill.late {
+  background: #fff1dd;
+  color: #986a30;
+}
+
+.att-pill.incomplete {
+  background: #fae7e3;
+  color: #99544a;
+}
+
+.att-pill.absent {
+  background: #f2f2ef;
+  color: #7b8375;
+  border: 1px solid #dcdfd5;
+}
+
+.att-pill.half_day {
+  background: #e2eff4;
+  color: #3f6071;
+}
+
+.att-pill.manual {
+  background: #f3ebfa;
+  color: #6d3ea1;
+}
+
+.att-pill.verified {
+  background: #e1f1e3;
+  color: #35663d;
+}
+
+.att-pill.flagged {
+  background: #fef8e7;
+  color: #8c6a1e;
+}
+
+.map-pin-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #43637a;
+  text-decoration: none;
+  font-size: 11px;
+  transition: color .15s;
+}
+
+.map-pin-link:hover {
+  color: #173248;
+  text-decoration: underline;
+}
+
+.admin-attendance-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1px;
+  border-top: 1px solid #dadad2;
+  border-bottom: 1px solid #dadad2;
+  margin-bottom: 32px;
+  background: #dadad2;
+}
+
+@media (max-width: 960px) {
+  .admin-attendance-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.admin-attendance-metric {
+  padding: 20px 22px;
+  background: #ffffff;
+}
+
+.admin-attendance-metric strong {
+  display: block;
+  font-size: 36px;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.05em;
+  margin-top: 12px;
+}
+
+.admin-attendance-metric small {
+  display: block;
+  margin-top: 6px;
+  color: #77796f;
+  font-size: 11px;
+}
+
+/* Live GPS Telemetry and Multi-Sample Verification */
+.gps-telemetry-panel {
+  margin-top: 20px;
+  padding: 18px 20px;
+  background: #fbfbf9;
+  border: 1px solid #dcdcd6;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.gps-telemetry-panel.acquiring {
+  border-color: #b5d5b7;
+  background: #f8fbf7;
+}
+
+.gps-telemetry-panel.insufficient,
+.gps-telemetry-panel.rejected,
+.gps-telemetry-panel.error {
+  border-color: #f0c9c4;
+  background: #fff8f7;
+}
+
+.gps-telemetry-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.gps-phase-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font: 11px 'DM Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  border-radius: 4px;
+}
+
+.gps-phase-pill.acquiring {
+  background: #eef6ee;
+  color: #386342;
+  border: 1px solid #cce5cd;
+}
+
+.gps-phase-pill.submitting {
+  background: #e6f0fa;
+  color: #1e5288;
+  border: 1px solid #bed6ee;
+}
+
+.gps-phase-pill.insufficient,
+.gps-phase-pill.rejected,
+.gps-phase-pill.error {
+  background: #fae7e3;
+  color: #99544a;
+  border: 1px solid #f2c7be;
+}
+
+.gps-telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  background: #ffffff;
+  padding: 14px 16px;
+  border: 1px solid #e7e7e2;
+  border-radius: 6px;
+}
+
+@media (max-width: 768px) {
+  .gps-telemetry-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gps-telemetry-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gps-telemetry-label {
+  font: 10px 'DM Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: #8c8f87;
+}
+
+.gps-telemetry-value {
+  font-size: 15px;
+  font-weight: 700;
+  color: #272a24;
+  letter-spacing: -0.02em;
+}
+
+.gps-telemetry-sub {
+  font-size: 11px;
+  color: #63685e;
+}
+
+.gps-telemetry-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.gps-telemetry-alert.error {
+  background: #fae7e3;
+  color: #99544a;
+  border: 1px solid #f2c7be;
+}
+
+.gps-troubleshooting-card {
+  padding: 12px 14px;
+  background: #ffffff;
+  border: 1px solid #e7e7e2;
+  border-radius: 6px;
+}
+
+.gps-telemetry-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.gps-btn-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #272a24;
+  color: #ffffff;
+  border: 0;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity .15s;
+}
+
+.gps-btn-retry:hover {
+  opacity: .9;
+}
+
+.gps-btn-cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #ffffff;
+  color: #57534e;
+  border: 1px solid #dadad2;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.gps-btn-cancel:hover {
+  background: #f5f5f4;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1.5s linear infinite;
+}
+

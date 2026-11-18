@@ -16,6 +16,9 @@ import {
   Clock,
   Clock3,
   Copy,
+  Crosshair,
+  Edit2,
+  ExternalLink,
   Eye,
   EyeOff,
   FileText,
@@ -26,6 +29,7 @@ import {
   Lock,
   LogOut,
   Mail,
+  MapPin,
   Menu,
   MoreHorizontal,
   Phone,
@@ -53,6 +57,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
+import { parseMetaInstantFormUrl } from '@/lib/metaFormParser';
 
 type Profile = { id: string; email: string; full_name: string; role: string; is_active: boolean };
 
@@ -116,7 +121,7 @@ type Client = {
   updated_at: string;
 };
 
-type Page = 'dashboard' | 'leads' | 'clients' | 'finance' | 'team' | 'settings' | 'deleted_leads' | 'unqualified_leads';
+type Page = 'dashboard' | 'leads' | 'clients' | 'attendance' | 'finance' | 'team' | 'settings' | 'deleted_leads' | 'unqualified_leads';
 type LeadQuickFilter = 'all' | 'today' | 'active' | 'follow_ups' | 'converted';
 type LeadForm = Omit<Lead, 'id' | 'created_at' | 'updated_at' | 'received_at' | 'meta_lead_id' | 'deleted_at' | 'deleted_by' | 'next_follow_up_at' | 'qualification_status' | 'unqualified_reason' | 'unqualified_notes' | 'unqualified_at' | 'unqualified_by'>;
 type ClientForm = Omit<Client, 'id' | 'created_by' | 'created_at' | 'updated_at' | 'lead_id'>;
@@ -142,6 +147,7 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard; adminOn
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'leads', label: 'Leads', icon: Target },
   { id: 'clients', label: 'Clients', icon: UsersRound },
+  { id: 'attendance', label: 'Attendance', icon: UserCheck, adminOnly: true },
   { id: 'unqualified_leads', label: 'Unqualified', icon: Ban, adminOnly: true },
   { id: 'deleted_leads', label: 'Deleted leads', icon: Trash2, adminOnly: true },
   { id: 'finance', label: 'Finance', icon: Tag, adminOnly: true },
@@ -284,8 +290,13 @@ function App() {
   useEffect(() => {
     if (view === 'set_password' || view === 'invite_error') return;
     if (!session) { setProfile(null); setView('login'); return; }
-    supabase.from('profiles').select('id, email, full_name, role, is_active').eq('id', session.user.id).maybeSingle().then(({ data, error }) => {
-      if (error || !data || !data.is_active) { setAuthError('This account does not have workspace access. Contact your administrator.'); setView('login'); }
+    supabase.from('profiles').select('id, email, full_name, role, is_active').eq('id', session.user.id).maybeSingle().then(async ({ data, error }) => {
+      if (error || !data || !data.is_active) {
+        await supabase.auth.signOut().catch(() => {});
+        setProfile(null);
+        setAuthError(data && !data.is_active ? 'This account has been deactivated. Please contact your administrator.' : 'This account does not have workspace access. Contact your administrator.');
+        setView('login');
+      }
       else { setProfile(data as Profile); setView('workspace'); }
     });
   }, [session, view]);
@@ -305,7 +316,14 @@ function Login({ error, onError, agencyBranding }: { error: string; onError: (me
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setLoading(true); onError('');
     const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
-    if (signInError) onError('The email or password is not correct. Please try again.');
+    if (signInError) {
+      const msg = signInError.message.toLowerCase();
+      if (msg.includes('banned') || msg.includes('deactivated') || msg.includes('disabled')) {
+        onError('This account has been deactivated. Please contact your administrator.');
+      } else {
+        onError('The email or password is not correct. Please try again.');
+      }
+    }
     setLoading(false);
   };
   return <main className="login-page">
@@ -411,7 +429,7 @@ function Workspace({
   const isAdmin = profile.role === 'admin';
   const allowedPages = useMemo<Page[]>(() => (
     isAdmin
-      ? ['dashboard', 'leads', 'clients', 'unqualified_leads', 'deleted_leads', 'finance', 'team', 'settings']
+      ? ['dashboard', 'leads', 'clients', 'attendance', 'unqualified_leads', 'deleted_leads', 'finance', 'team', 'settings']
       : ['dashboard', 'leads', 'clients']
   ), [isAdmin]);
 
@@ -666,6 +684,7 @@ function Workspace({
       {page === 'dashboard' && <Dashboard leads={activeLeads} profiles={profiles} clients={clients} profile={profile} onOpenLeads={() => handleNavigateToLeads('all')} onOpenClients={() => handleNavigate('clients')} onAdd={() => setShowAdd(true)} onOpenConverted={() => setShowConverted(true)} onOpenClient={(c) => setSelectedClient(c)} onNavigateFilteredLeads={handleNavigateToLeads} />}
       {page === 'leads' && <LeadsPage leads={activeLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAdd(true)} onSelect={setSelectedLead} quickFilter={leadQuickFilter} onQuickFilterChange={setLeadQuickFilter} deletedCount={deletedLeads.length} unqualifiedCount={unqualifiedLeads.length} onOpenDeleted={() => handleNavigate('deleted_leads')} onOpenUnqualified={() => handleNavigate('unqualified_leads')} onOpenConverted={() => setShowConverted(true)} />}
       {page === 'clients' && <ClientsPage clients={clients} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onAdd={() => setShowAddClient(true)} onSelect={setSelectedClient} />}
+      {isAdmin && page === 'attendance' && <AttendanceAdminPage profile={profile} profiles={profiles} />}
       {isAdmin && page === 'unqualified_leads' && <UnqualifiedLeadsPage leads={unqualifiedLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onSelect={setSelectedLead} />}
       {isAdmin && page === 'deleted_leads' && <DeletedLeadsPage leads={deletedLeads} profiles={profiles} profile={profile} loading={loading} error={dataError} onRetry={loadData} onRestore={restoreLead} />}
       {isAdmin && page === 'team' && <TeamPage profile={profile} />}
@@ -697,6 +716,618 @@ function Workspace({
     {selectedClient && <ClientDetail client={selectedClient} profiles={profiles} profile={profile} onClose={() => setSelectedClient(null)} onSave={(form) => saveClient(form, selectedClient.id)} />}
     {showConverted && <ConvertedLeadsView leads={activeLeads.filter((l) => l.status === 'converted')} clients={clients} profiles={profiles} onClose={() => setShowConverted(false)} onOpenClient={(c) => { setShowConverted(false); setSelectedClient(c); }} />}
   </div>;
+}
+
+// ============================================================================
+// OFFICE GPS ATTENDANCE TYPES & HELPERS
+// ============================================================================
+
+type AttendanceSettings = {
+  id: string;
+  office_address: string;
+  office_lat: number;
+  office_lng: number;
+  geofence_radius_meters: number;
+  timezone: string;
+  late_threshold_time: string;
+  max_gps_accuracy_meters: number;
+  updated_at?: string;
+  updated_by?: string | null;
+};
+
+type AttendanceRecord = {
+  id: string;
+  profile_id: string;
+  attendance_date: string;
+  check_in_time: string | null;
+  check_in_lat: number | null;
+  check_in_lng: number | null;
+  check_in_accuracy: number | null;
+  check_in_distance_meters: number | null;
+  check_out_time: string | null;
+  check_out_lat: number | null;
+  check_out_lng: number | null;
+  check_out_accuracy: number | null;
+  check_out_distance_meters: number | null;
+  status: 'present' | 'late' | 'incomplete' | 'absent' | 'half_day';
+  verification_status: 'verified' | 'flagged' | 'rejected' | 'manual_override';
+  verification_notes?: string | null;
+  is_corrected: boolean;
+  corrected_by?: string | null;
+  corrected_at?: string | null;
+  correction_reason?: string | null;
+  original_data?: any[] | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function getTodayDateString(timeZone = 'Asia/Kolkata'): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === 'year')?.value;
+  const month = parts.find((p) => p.type === 'month')?.value;
+  const day = parts.find((p) => p.type === 'day')?.value;
+  return `${year}-${month}-${day}`;
+}
+
+function formatAttendanceTime(isoString: string | null | undefined, timeZone = 'Asia/Kolkata'): string {
+  if (!isoString) return '—';
+  try {
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    }).format(new Date(isoString));
+  } catch {
+    return '—';
+  }
+}
+
+function formatDistanceMeters(meters: number | null | undefined): string {
+  if (meters == null || isNaN(meters)) return '—';
+  if (meters < 1000) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(2)} km`;
+}
+
+function calculateWorkDuration(checkIn: string | null | undefined, checkOut: string | null | undefined): string {
+  if (!checkIn) return '—';
+  const start = new Date(checkIn).getTime();
+  const end = checkOut ? new Date(checkOut).getTime() : Date.now();
+  if (isNaN(start) || isNaN(end) || end <= start) return '—';
+  const diffMs = end - start;
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const mins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  if (hours === 0) return `${mins}m`;
+  return `${hours}h ${mins}m`;
+}
+
+function formatShiftThreshold(timeStr: string | null | undefined): string {
+  if (!timeStr) return '10:00 AM IST';
+  const clean = timeStr.trim();
+  const [hStr, mStr] = clean.split(':');
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr || '0', 10);
+  if (isNaN(h)) return '10:00 AM IST';
+  const period = h >= 12 ? 'PM' : 'AM';
+  const displayH = h % 12 === 0 ? 12 : h % 12;
+  const displayM = m.toString().padStart(2, '0');
+  return `${displayH}:${displayM} ${period} IST`;
+}
+
+function calculateClientDistanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return 0;
+  const r = 6371000;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(Math.min(1, a)), Math.sqrt(Math.max(0, 1 - a)));
+  return Math.round(r * c * 10) / 10;
+}
+
+interface GPSFix {
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  distanceMeters: number;
+  timestamp: number;
+}
+
+type GPSState = {
+  active: boolean;
+  action: 'check_in' | 'check_out';
+  phase: 'idle' | 'acquiring' | 'submitting' | 'insufficient' | 'rejected' | 'error';
+  sampleCount: number;
+  currentFix: GPSFix | null;
+  bestFix: GPSFix | null;
+  errorMessage?: string;
+};
+
+function DashboardAttendanceWidget({ profile }: { profile: Profile }) {
+  const [record, setRecord] = useState<AttendanceRecord | null>(null);
+  const [settings, setSettings] = useState<AttendanceSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+
+  const [gpsState, setGpsState] = useState<GPSState>({
+    active: false,
+    action: 'check_in',
+    phase: 'idle',
+    sampleCount: 0,
+    currentFix: null,
+    bestFix: null,
+  });
+
+  const watchIdRef = useRef<number | null>(null);
+  const timeoutRef = useRef<any>(null);
+  const samplesRef = useRef<GPSFix[]>([]);
+  const isSubmittingRef = useRef<boolean>(false);
+
+  const todayStr = useMemo(() => getTodayDateString(), []);
+
+  const loadAttendance = async () => {
+    try {
+      setLoading(true);
+      const [settingsRes, recordRes] = await Promise.all([
+        supabase.from('attendance_settings').select('*').eq('id', 'default').maybeSingle(),
+        supabase.from('attendance_records').select('*').eq('profile_id', profile.id).eq('attendance_date', todayStr).maybeSingle(),
+      ]);
+
+      if (settingsRes.data) {
+        setSettings(settingsRes.data);
+      }
+      if (recordRes.data) {
+        setRecord(recordRes.data);
+      } else {
+        setRecord(null);
+      }
+    } catch (err: any) {
+      console.error('Error loading attendance status:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAttendance();
+  }, [profile.id, todayStr]);
+
+  const stopGPSWatch = () => {
+    if (watchIdRef.current != null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      stopGPSWatch();
+    };
+  }, []);
+
+  const cancelGPSFlow = () => {
+    stopGPSWatch();
+    isSubmittingRef.current = false;
+    setGpsState((prev) => ({
+      ...prev,
+      active: false,
+      phase: 'idle',
+    }));
+  };
+
+  const submitAttendanceFix = async (action: 'check_in' | 'check_out', fix: GPSFix) => {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    setGpsState((prev) => ({ ...prev, phase: 'submitting', bestFix: fix }));
+
+    try {
+      const rpcName = action === 'check_in' ? 'record_attendance_check_in' : 'record_attendance_check_out';
+      const { data, error } = await supabase.rpc(rpcName, {
+        p_latitude: fix.latitude,
+        p_longitude: fix.longitude,
+        p_accuracy: fix.accuracy,
+      });
+
+      if (error) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'rejected',
+          errorMessage: error.message || `Failed to record ${action.replace('_', ' ')}.`,
+        }));
+        return;
+      }
+
+      if (data?.record) {
+        setRecord(data.record);
+        setMessage({ type: 'success', text: data.message || `Successfully recorded ${action.replace('_', ' ')}!` });
+      } else {
+        await loadAttendance();
+        setMessage({ type: 'success', text: `Attendance updated successfully.` });
+      }
+
+      setGpsState((prev) => ({ ...prev, active: false, phase: 'idle' }));
+    } catch (err: any) {
+      setGpsState((prev) => ({
+        ...prev,
+        phase: 'rejected',
+        errorMessage: err.message || 'Server error recording attendance.',
+      }));
+    } finally {
+      isSubmittingRef.current = false;
+    }
+  };
+
+  const startGPSFlow = (action: 'check_in' | 'check_out') => {
+    setMessage(null);
+    stopGPSWatch();
+    isSubmittingRef.current = false;
+    samplesRef.current = [];
+
+    if (!navigator.geolocation) {
+      setMessage({ type: 'error', text: 'Geolocation is not supported by your browser.' });
+      return;
+    }
+
+    const officeLat = Number(settings?.office_lat) || 13.0693169;
+    const officeLng = Number(settings?.office_lng) || 80.1814571;
+    const maxAccuracy = Number(settings?.max_gps_accuracy_meters) || 150.0;
+
+    setGpsState({
+      active: true,
+      action,
+      phase: 'acquiring',
+      sampleCount: 0,
+      currentFix: null,
+      bestFix: null,
+      errorMessage: undefined,
+    });
+
+    const evaluateSamples = (samples: GPSFix[]) => {
+      stopGPSWatch();
+      if (samples.length === 0) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'error',
+          errorMessage: 'Could not obtain a GPS fix from your device. Please ensure location services are enabled and try again.',
+        }));
+        return;
+      }
+
+      // Pick reading with lowest accuracy radius in metres
+      const best = samples.reduce((b, s) => (!b || s.accuracy < b.accuracy ? s : b), samples[0]);
+
+      if (best.accuracy > maxAccuracy) {
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'insufficient',
+          bestFix: best,
+          errorMessage: `GPS accuracy (±${Math.round(best.accuracy)}m) is insufficient. Office attendance requires accuracy within ±${Math.round(maxAccuracy)}m.`,
+        }));
+        return;
+      }
+
+      // Reliable reading: proceed to authoritative backend verification
+      submitAttendanceFix(action, best);
+    };
+
+    // Safety timeout: settle after 7 seconds of sampling
+    timeoutRef.current = setTimeout(() => {
+      if (samplesRef.current.length > 0) {
+        evaluateSamples(samplesRef.current);
+      } else {
+        stopGPSWatch();
+        setGpsState((prev) => ({
+          ...prev,
+          phase: 'error',
+          errorMessage: 'GPS request timed out waiting for a fix. Please try again with a clearer view of the sky or near an open window.',
+        }));
+      }
+    }, 7000);
+
+    try {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          const acc = pos.coords.accuracy;
+          const dist = calculateClientDistanceMeters(lat, lng, officeLat, officeLng);
+
+          const fix: GPSFix = {
+            latitude: lat,
+            longitude: lng,
+            accuracy: acc,
+            distanceMeters: dist,
+            timestamp: pos.timestamp || Date.now(),
+          };
+
+          samplesRef.current.push(fix);
+          const currentCount = samplesRef.current.length;
+          const currentBest = samplesRef.current.reduce((b, s) => (!b || s.accuracy < b.accuracy ? s : b), fix);
+
+          setGpsState((prev) => ({
+            ...prev,
+            sampleCount: currentCount,
+            currentFix: fix,
+            bestFix: currentBest,
+          }));
+
+          // Fast-path: if accuracy is <= 25m (satellite lock) and we have >= 2 readings, settle immediately
+          if (fix.accuracy <= 25 && currentCount >= 2) {
+            evaluateSamples(samplesRef.current);
+          } else if (currentCount >= 4) {
+            evaluateSamples(samplesRef.current);
+          }
+        },
+        (err) => {
+          stopGPSWatch();
+          let msg = 'Could not acquire GPS position.';
+          if (err.code === 1) {
+            msg = 'Location permission was denied. Please allow location access in your browser settings to verify your attendance within the office geofence.';
+          } else if (err.code === 2) {
+            msg = 'GPS position unavailable. Please ensure your device location is enabled and try again.';
+          } else if (err.code === 3) {
+            msg = 'GPS request timed out. Please click Retry GPS Reading with clear reception.';
+          }
+          setGpsState((prev) => ({
+            ...prev,
+            phase: 'error',
+            errorMessage: msg,
+          }));
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 0,
+        }
+      );
+    } catch (e: any) {
+      stopGPSWatch();
+      setGpsState((prev) => ({
+        ...prev,
+        phase: 'error',
+        errorMessage: e.message || 'Error initializing browser geolocation.',
+      }));
+    }
+  };
+
+  const isCheckedIn = !!record?.check_in_time;
+  const isCheckedOut = !!record?.check_out_time;
+
+  return (
+    <section className="attendance-widget-card">
+      <div className="attendance-widget-header">
+        <div className="attendance-widget-title-group">
+          <p className="eyebrow" style={{ display: 'flex', alignItems: 'center', gap: 6, margin: 0 }}>
+            <MapPin size={13} style={{ color: '#4a5c2d' }} />
+            Office GPS Attendance / 100m Geofence
+          </p>
+          <h2>Today&apos;s Attendance</h2>
+          <p>
+            Registered Office: {settings?.office_address || '2/116, Daya Sadan Main Road, Pallavan Nagar, Koyambedu, Chennai'} • Timezone: {settings?.timezone || 'Asia/Kolkata'}
+          </p>
+        </div>
+
+        <div style={{ textAlign: 'right' }}>
+          <span style={{ font: "11px 'DM Mono', monospace", color: '#77796f', textTransform: 'uppercase' }}>
+            Shift Threshold: {formatShiftThreshold(settings?.late_threshold_time)}
+          </span>
+        </div>
+      </div>
+
+      <div className="attendance-widget-body">
+        <div className="attendance-status-box">
+          <div
+            className={`attendance-status-icon-wrap ${
+              isCheckedOut ? 'done' : isCheckedIn ? (record?.status === 'late' ? 'late' : 'active') : ''
+            }`}
+          >
+            {isCheckedOut ? (
+              <CheckCircle2 size={24} />
+            ) : isCheckedIn ? (
+              record?.status === 'late' ? <Clock3 size={24} /> : <Check size={24} />
+            ) : (
+              <MapPin size={24} />
+            )}
+          </div>
+
+          <div className="attendance-status-details">
+            {loading ? (
+              <span>Checking attendance status...</span>
+            ) : isCheckedOut ? (
+              <>
+                <strong>Workday Completed</strong>
+                <span>
+                  Checked In: {formatAttendanceTime(record.check_in_time)} • Checked Out: {formatAttendanceTime(record.check_out_time)} ({calculateWorkDuration(record.check_in_time, record.check_out_time)})
+                </span>
+              </>
+            ) : isCheckedIn ? (
+              <>
+                <strong>
+                  Checked In — {record.status === 'late' ? 'Late Arrival' : 'On Time'}
+                  {record.verification_status === 'flagged' && <span style={{ color: '#986a30', fontSize: 11, fontWeight: 500, marginLeft: 8 }}>(Marginal GPS Accuracy)</span>}
+                </strong>
+                <span>
+                  Checked in at {formatAttendanceTime(record.check_in_time)} ({formatDistanceMeters(record.check_in_distance_meters)} from office, ±{Math.round(record.check_in_accuracy || 0)}m GPS accuracy)
+                </span>
+              </>
+            ) : (
+              <>
+                <strong>Not Checked In Today</strong>
+                <span>
+                  Attendance must be marked within 100 metres of the registered office. High-accuracy GPS will only be captured when you click Check In.
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="attendance-actions-group">
+          <button
+            type="button"
+            className="attendance-btn-checkin"
+            disabled={loading || gpsState.active || isCheckedIn}
+            onClick={() => startGPSFlow('check_in')}
+            title={isCheckedIn ? 'You have already checked in today' : 'Record check-in within office radius'}
+          >
+            <Crosshair size={16} />
+            {isCheckedIn ? 'Checked In' : 'Check In'}
+          </button>
+
+          <button
+            type="button"
+            className="attendance-btn-checkout"
+            disabled={loading || gpsState.active || !isCheckedIn || isCheckedOut}
+            onClick={() => startGPSFlow('check_out')}
+            title={
+              !isCheckedIn
+                ? 'Check in is required before checking out'
+                : isCheckedOut
+                ? 'Already checked out for today'
+                : 'Record check-out within office radius'
+            }
+          >
+            <LogOut size={16} />
+            {isCheckedOut ? 'Checked Out' : 'Check Out'}
+          </button>
+        </div>
+      </div>
+
+      {/* Live GPS Telemetry Panel during acquisition & error / retry */}
+      {gpsState.active && (
+        <div className={`gps-telemetry-panel ${gpsState.phase}`}>
+          <div className="gps-telemetry-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Crosshair size={16} className={gpsState.phase === 'acquiring' ? 'spin' : ''} style={{ color: '#386342' }} />
+              <strong style={{ fontSize: 13, color: '#272a24' }}>
+                {gpsState.action === 'check_in' ? 'Check In' : 'Check Out'} — GPS Location Verification
+              </strong>
+            </div>
+            <span className={`gps-phase-pill ${gpsState.phase}`}>
+              {gpsState.phase === 'acquiring' && `Sampling GPS (${gpsState.sampleCount}/4)...`}
+              {gpsState.phase === 'submitting' && 'Verifying with Server...'}
+              {gpsState.phase === 'insufficient' && 'Accuracy Insufficient'}
+              {gpsState.phase === 'rejected' && 'Server Rejected'}
+              {gpsState.phase === 'error' && 'Sensor Error'}
+            </span>
+          </div>
+
+          <div className="gps-telemetry-grid">
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Detected Coordinates</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? `${(gpsState.bestFix || gpsState.currentFix)!.latitude.toFixed(6)}, ${(gpsState.bestFix || gpsState.currentFix)!.longitude.toFixed(6)}`
+                  : 'Acquiring satellite fix...'}
+              </strong>
+              <small className="gps-telemetry-sub">Hardware / Browser GPS</small>
+            </div>
+
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Reported Accuracy</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? `±${Math.round((gpsState.bestFix || gpsState.currentFix)!.accuracy)} m`
+                  : '—'}
+              </strong>
+              <small className="gps-telemetry-sub">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? (gpsState.bestFix || gpsState.currentFix)!.accuracy <= 30
+                    ? 'High Precision'
+                    : (gpsState.bestFix || gpsState.currentFix)!.accuracy <= (Number(settings?.max_gps_accuracy_meters) || 150)
+                    ? 'Acceptable (≤150m)'
+                    : 'Poor (>150m threshold)'
+                  : 'Max allowed: ±150m'}
+              </small>
+            </div>
+
+            <div className="gps-telemetry-item">
+              <span className="gps-telemetry-label">Distance from Office</span>
+              <strong className="gps-telemetry-value">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? formatDistanceMeters((gpsState.bestFix || gpsState.currentFix)!.distanceMeters)
+                  : '—'}
+              </strong>
+              <small className="gps-telemetry-sub">
+                {gpsState.bestFix || gpsState.currentFix
+                  ? (gpsState.bestFix || gpsState.currentFix)!.distanceMeters <= (Number(settings?.geofence_radius_meters) || 100)
+                    ? 'Inside 100m Geofence'
+                    : `Outside Geofence (${Math.round((gpsState.bestFix || gpsState.currentFix)!.distanceMeters)}m > 100m)`
+                  : 'Geofence limit: 100m'}
+              </small>
+            </div>
+          </div>
+
+          {gpsState.errorMessage && (
+            <div className="gps-telemetry-alert error">
+              <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+              <div>{gpsState.errorMessage}</div>
+            </div>
+          )}
+
+          {(gpsState.phase === 'insufficient' || gpsState.phase === 'error') && (
+            <div className="gps-troubleshooting-card">
+              <p style={{ fontWeight: 600, fontSize: 12, margin: '0 0 6px 0', color: '#272a24' }}>
+                Device Location Guidance (Windows / Android / iPhone):
+              </p>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 11, color: '#57534e', lineHeight: 1.6 }}>
+                <li><strong>Windows Laptops:</strong> In <em>Settings &gt; Privacy &amp; security &gt; Location</em>, ensure Location Services are ON. Moving closer to an open window enhances accuracy.</li>
+                <li><strong>iPhones (iOS Safari / Chrome):</strong> In <em>Settings &gt; Safari (or Chrome) &gt; Location</em>, verify that <strong>Precise Location</strong> is toggled <strong>ON</strong>.</li>
+                <li><strong>Android Phones:</strong> Enable <strong>Google Location Accuracy</strong> in <em>Settings &gt; Location</em> for optimal satellite lock.</li>
+              </ul>
+            </div>
+          )}
+
+          <div className="gps-telemetry-actions">
+            {(gpsState.phase === 'insufficient' || gpsState.phase === 'rejected' || gpsState.phase === 'error') && (
+              <button
+                type="button"
+                className="gps-btn-retry"
+                onClick={() => startGPSFlow(gpsState.action)}
+              >
+                <RotateCcw size={14} />
+                Retry GPS Reading
+              </button>
+            )}
+            <button
+              type="button"
+              className="gps-btn-cancel"
+              onClick={cancelGPSFlow}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {message && (
+        <div className={`attendance-alert ${message.type}`}>
+          {message.type === 'error' && <AlertTriangle size={16} style={{ flexShrink: 0 }} />}
+          {message.type === 'success' && <CheckCircle2 size={16} style={{ flexShrink: 0 }} />}
+          {message.type === 'info' && <Clock size={16} style={{ flexShrink: 0 }} />}
+          <div style={{ flex: 1 }}>{message.text}</div>
+          <button
+            type="button"
+            onClick={() => setMessage(null)}
+            style={{ border: 0, background: 'none', color: 'inherit', padding: 2, cursor: 'pointer' }}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function Dashboard({
@@ -789,6 +1420,9 @@ function Dashboard({
         </div>
       ))}
     </section>
+
+    {/* Office GPS Attendance Widget (Self-service for employees and salespeople) */}
+    {!isAdmin && <DashboardAttendanceWidget profile={profile} />}
 
     <div className="dashboard-grid">
       <section className="panel activity-panel">
@@ -2438,10 +3072,10 @@ const teamRoles: { id: string; label: string }[] = [
 ];
 const roleLabels: Record<string, string> = Object.fromEntries(teamRoles.map((r) => [r.id, r.label]));
 
-async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active', payload: Record<string, unknown>) {
+async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active' | 'delete_employee', payload: Record<string, unknown>) {
   const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.access_token) throw new Error('You are not signed in.');
-  const method = action === 'create' ? 'POST' : 'PATCH';
+  if (!session?.access_token) throw new Error('You are not signed in. Please sign in to continue.');
+  const method = action === 'create' ? 'POST' : action === 'delete_employee' ? 'DELETE' : 'PATCH';
   const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/team-admin`, {
     method,
     headers: {
@@ -2452,30 +3086,41 @@ async function callTeamAdmin(action: 'create' | 'set_role' | 'toggle_active', pa
     body: JSON.stringify(action === 'create' ? payload : { action, ...payload }),
   });
   if (!response.ok) {
-    let message = 'Something went wrong.';
-    try { const body = await response.json(); if (body?.error) message = body.error; } catch { /* ignore */ }
+    let message = `Request failed (${response.status} ${response.statusText || 'Error'}).`;
+    try {
+      const body = await response.json();
+      if (body?.error) message = body.error;
+      else if (body?.message) message = body.message;
+    } catch {
+      try {
+        const text = await response.text();
+        if (text && text.length < 200) message = text;
+      } catch { /* ignore */ }
+    }
     throw new Error(message);
   }
-  return (await response.json()) as { method?: 'invite' | 'temp_password'; temp_password?: string };
+  return (await response.json()) as { method?: 'invite' | 'temp_password'; temp_password?: string; success?: boolean; message?: string };
 }
 
 function TeamPage({ profile }: { profile: Profile }) {
   const isAdmin = profile.role === 'admin';
   const [employees, setEmployees] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [actionSuccess, setActionSuccess] = useState('');
   const [query, setQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState('All roles');
   const [statusFilter, setStatusFilter] = useState('All status');
   const [showAdd, setShowAdd] = useState(false);
   const [actionRow, setActionRow] = useState<Profile | null>(null);
-  const [confirmState, setConfirmState] = useState<{ profile: Profile; action: 'set_role' | 'toggle_active'; newRole?: string; newActive?: boolean } | null>(null);
+  const [confirmState, setConfirmState] = useState<{ profile: Profile; action: 'set_role' | 'toggle_active' | 'delete_employee'; newRole?: string; newActive?: boolean } | null>(null);
   const [working, setWorking] = useState(false);
 
   const loadEmployees = async () => {
-    setLoading(true); setError('');
+    setLoading(true); setLoadError('');
     const { data, error: err } = await supabase.from('profiles').select('id, email, full_name, role, is_active').order('full_name');
-    if (err) setError(friendlyError());
+    if (err) setLoadError(friendlyError());
     else setEmployees((data ?? []) as Profile[]);
     setLoading(false);
   };
@@ -2490,16 +3135,23 @@ function TeamPage({ profile }: { profile: Profile }) {
   const runAction = async () => {
     if (!confirmState) return;
     setWorking(true);
+    setActionError('');
+    setActionSuccess('');
     try {
       if (confirmState.action === 'set_role' && confirmState.newRole) {
         await callTeamAdmin('set_role', { user_id: confirmState.profile.id, role: confirmState.newRole });
+        setActionSuccess(`Role for ${confirmState.profile.full_name} updated successfully.`);
       } else if (confirmState.action === 'toggle_active') {
-        await callTeamAdmin('toggle_active', { user_id: confirmState.profile.id, is_active: confirmState.newActive ?? false });
+        const res = await callTeamAdmin('toggle_active', { user_id: confirmState.profile.id, is_active: confirmState.newActive ?? false });
+        setActionSuccess(res?.message || (confirmState.newActive ? `Account for ${confirmState.profile.full_name} activated successfully.` : `Account for ${confirmState.profile.full_name} deactivated successfully.`));
+      } else if (confirmState.action === 'delete_employee') {
+        const res = await callTeamAdmin('delete_employee', { user_id: confirmState.profile.id });
+        setActionSuccess(res?.message || `Account for ${confirmState.profile.full_name} permanently deleted.`);
       }
       setConfirmState(null);
       await loadEmployees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : friendlyError());
+      setActionError(e instanceof Error ? e.message : 'An unexpected error occurred while processing the request.');
     } finally {
       setWorking(false);
     }
@@ -2508,17 +3160,36 @@ function TeamPage({ profile }: { profile: Profile }) {
   return <div className="page-content">
     <div className="page-title-row leads-title"><div><p className="eyebrow">Team / {employees.length.toString().padStart(2, '0')} members</p><h1>Team management</h1><p className="subtitle">Every workspace member, clearly accounted for.</p></div>{isAdmin && <button className="lime-button" onClick={() => setShowAdd(true)}><UserPlus size={18} /> Add employee</button>}</div>
     <div className="filter-bar"><div className="search-box"><Search size={18} /><input placeholder="Search team members" value={query} onChange={(e) => setQuery(e.target.value)} /></div><div className="filter-select"><Filter size={16} /><select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}><option>All roles</option>{teamRoles.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}</select></div><div className="filter-select"><select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}><option>All status</option><option>Active</option><option>Inactive</option></select></div></div>
-    {error && <div className="data-state"><CircleAlert size={22} /><h3>Something went wrong</h3><p>{error}</p><button className="outline-button" onClick={() => { setError(''); loadEmployees(); }}>Try again</button></div>}
-    {!error && loading ? <div className="data-state"><div className="spinner" /><p>Loading team members…</p></div>
-     : !error && filtered.length === 0 ? <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>No team members found</h3><p>Adjust your search or add a new employee.</p></div>
-     : !error && <div className="lead-table-wrap"><table className="lead-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>
+    {actionError && (
+      <div className="attendance-alert error" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, color: '#991b1b', fontSize: 13 }}>
+        <CircleAlert size={16} />
+        <div style={{ flex: 1 }}><strong>Action failed:</strong> {actionError}</div>
+        <button type="button" onClick={() => setActionError('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#991b1b', fontSize: 18, lineHeight: 1 }}>&times;</button>
+      </div>
+    )}
+    {actionSuccess && (
+      <div className="attendance-alert success" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, color: '#166534', fontSize: 13 }}>
+        <CheckCircle2 size={16} />
+        <div style={{ flex: 1 }}>{actionSuccess}</div>
+        <button type="button" onClick={() => setActionSuccess('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#166534', fontSize: 18, lineHeight: 1 }}>&times;</button>
+      </div>
+    )}
+    {loadError && employees.length === 0 ? (
+      <div className="data-state"><CircleAlert size={22} /><h3>Something went wrong</h3><p>{loadError}</p><button className="outline-button" onClick={() => { setLoadError(''); loadEmployees(); }}>Try again</button></div>
+    ) : !loadError && loading && employees.length === 0 ? (
+      <div className="data-state"><div className="spinner" /><p>Loading team members…</p></div>
+    ) : !loadError && filtered.length === 0 ? (
+      <div className="data-state"><div className="empty-icon"><UsersRound size={22} /></div><h3>No team members found</h3><p>Adjust your search or add a new employee.</p></div>
+    ) : (
+      <div className="lead-table-wrap"><table className="lead-table"><thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Created</th><th /></tr></thead><tbody>
       {filtered.map((e) => <tr key={e.id}><td><div className="table-person"><div className="small-avatar" style={{ opacity: e.is_active ? 1 : 0.45 }}>{e.full_name.slice(0, 1).toUpperCase()}</div><div><strong>{e.full_name}</strong><span>{e.email}</span></div></div></td>
         <td><span className={`team-role-pill ${e.role}`}>{e.role === 'admin' ? 'Admin' : roleLabels[e.role] ?? e.role}</span></td>
         <td><span className={`active-pill ${e.is_active ? 'on' : 'off'}`}><span className="active-dot" />{e.is_active ? 'Active' : 'Inactive'}</span></td>
         <td><span className="muted">Team member</span></td>
         <td>{isAdmin && e.role !== 'admin' ? <button className="row-action" aria-label={`Manage ${e.full_name}`} onClick={() => setActionRow(e)}><MoreHorizontal size={18} /></button> : <span className="muted">—</span>}</td>
       </tr>)}
-    </tbody></table></div>}
+    </tbody></table></div>
+    )}
     {showAdd && isAdmin && <AddEmployeeModal onClose={() => setShowAdd(false)} onCreated={async () => { setShowAdd(false); await loadEmployees(); }} />}
     {actionRow && isAdmin && <EmployeeActionDrawer profile={actionRow} onClose={() => setActionRow(null)} onConfirm={(action, value) => { setActionRow(null); setConfirmState({ profile: actionRow, action, newRole: action === 'set_role' ? (value as string) : undefined, newActive: action === 'toggle_active' ? Boolean(value) : undefined }); }} />}
     {confirmState && <ConfirmDialog state={confirmState} working={working} onCancel={() => setConfirmState(null)} onConfirm={runAction} />}
@@ -2573,7 +3244,7 @@ function AddEmployeeModal({ onClose, onCreated }: { onClose: () => void; onCreat
   </div>;
 }
 
-function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profile; onClose: () => void; onConfirm: (action: 'set_role' | 'toggle_active', value: string | boolean) => void }) {
+function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profile; onClose: () => void; onConfirm: (action: 'set_role' | 'toggle_active' | 'delete_employee', value: string | boolean) => void }) {
   const [selectedRole, setSelectedRole] = useState(profile.role);
   return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
     <section className="lead-drawer"><div className="drawer-header"><div><p className="eyebrow">Manage member</p><h2>{profile.full_name}</h2></div><button className="close-button" onClick={onClose}><X size={20} /></button></div>
@@ -2584,12 +3255,62 @@ function EmployeeActionDrawer({ profile, onClose, onConfirm }: { profile: Profil
         <div className="team-divider" />
         <p className="eyebrow">Access</p>
         <div className="team-toggle-row"><div><strong>{profile.is_active ? 'Deactivate account' : 'Activate account'}</strong><span>{profile.is_active ? 'Prevent sign-in without deleting the account.' : 'Allow this member to sign in again.'}</span></div><button className="outline-button" onClick={() => onConfirm('toggle_active', !profile.is_active)}>{profile.is_active ? 'Deactivate' : 'Activate'}</button></div>
+        <div className="team-divider" />
+        <p className="eyebrow" style={{ color: '#99544a' }}>Danger Zone</p>
+        <div className="team-toggle-row" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
+          <div>
+            <strong style={{ color: '#99544a' }}>Permanently delete account</strong>
+            <span>Remove employee and auth credentials. Historical leads and clients are safely preserved.</span>
+          </div>
+          <button
+            type="button"
+            className="outline-button"
+            style={{ borderColor: '#f43f5e', color: '#f43f5e' }}
+            onClick={() => onConfirm('delete_employee', '')}
+          >
+            Delete account
+          </button>
+        </div>
       </div>
     </section>
   </div>;
 }
 
-function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profile: Profile; action: 'set_role' | 'toggle_active'; newRole?: string; newActive?: boolean }; working: boolean; onCancel: () => void; onConfirm: () => void }) {
+function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profile: Profile; action: 'set_role' | 'toggle_active' | 'delete_employee'; newRole?: string; newActive?: boolean }; working: boolean; onCancel: () => void; onConfirm: () => void }) {
+  if (state.action === 'delete_employee') {
+    return (
+      <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
+        <section className="confirm-dialog" style={{ maxWidth: 440 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, color: '#99544a' }}>
+            <AlertTriangle size={22} />
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Delete Employee Account</h3>
+          </div>
+          <p style={{ margin: '0 0 14px', fontSize: 13, lineHeight: 1.5, color: '#30342d' }}>
+            Are you sure you want to permanently delete <strong>{state.profile.full_name}</strong>?
+          </p>
+          <div style={{ background: '#f5f5f4', padding: '10px 12px', border: '1px solid #dadad2', marginBottom: 14, fontSize: 12 }}>
+            <div style={{ marginBottom: 4 }}><strong>Email:</strong> {state.profile.email}</div>
+            <div><strong>Role:</strong> {roleLabels[state.profile.role] ?? state.profile.role}</div>
+          </div>
+          <p style={{ margin: '0 0 16px', fontSize: 12, color: '#77796f', lineHeight: 1.4 }}>
+            This action cannot be undone. Authentication credentials and login access will be permanently removed. Assigned leads and clients will be safely unassigned or preserved.
+          </p>
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 14 }}>
+            <button className="outline-button" onClick={onCancel} disabled={working}>Cancel</button>
+            <button
+              className="lime-button"
+              style={{ background: '#f43f5e', color: '#fff', borderColor: '#e11d48' }}
+              onClick={onConfirm}
+              disabled={working}
+            >
+              {working ? 'Deleting…' : 'Delete permanently'}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   const text = state.action === 'set_role'
     ? `Change ${state.profile.full_name}'s role to ${roleLabels[state.newRole ?? ''] ?? state.newRole}?`
     : state.newActive
@@ -2598,14 +3319,1129 @@ function ConfirmDialog({ state, working, onCancel, onConfirm }: { state: { profi
   return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}><section className="confirm-dialog"><p>{text}</p><div className="drawer-footer"><button className="outline-button" onClick={onCancel} disabled={working}>Cancel</button><button className="lime-button" onClick={onConfirm} disabled={working}>{working ? 'Saving…' : 'Confirm'}</button></div></section></div>;
 }
 
+// ============================================================================
+// ADMIN ATTENDANCE MANAGEMENT COMPONENTS
+// ============================================================================
+
+function AttendanceAdminPage({
+  profile,
+  profiles,
+}: {
+  profile: Profile;
+  profiles: Profile[];
+}) {
+  const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateString());
+  const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [settings, setSettings] = useState<AttendanceSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [dataError, setDataError] = useState('');
+
+  // Filter states
+  const [searchQuery, setSearchQuery] = useState('');
+  const [roleFilter, setRoleFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+
+  // Modal states
+  const [selectedCorrection, setSelectedCorrection] = useState<{
+    record?: AttendanceRecord;
+    profile: Profile;
+    date: string;
+  } | null>(null);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showManualModal, setShowManualModal] = useState(false);
+
+  // Exclude admin role completely from employee attendance listings and metrics
+  const employeeProfiles = useMemo(() => profiles.filter((p) => p.is_active && p.role !== 'admin'), [profiles]);
+  const employeeProfileIds = useMemo(() => new Set(employeeProfiles.map((p) => p.id)), [employeeProfiles]);
+  const employeeRecords = useMemo(() => records.filter((r) => employeeProfileIds.has(r.profile_id)), [records, employeeProfileIds]);
+  const todayStr = useMemo(() => getTodayDateString(), []);
+
+  const loadData = async () => {
+    setLoading(true);
+    setDataError('');
+    try {
+      const [settingsRes, recordsRes] = await Promise.all([
+        supabase.from('attendance_settings').select('*').eq('id', 'default').maybeSingle(),
+        supabase.from('attendance_records').select('*').eq('attendance_date', selectedDate),
+      ]);
+
+      if (settingsRes.error) throw settingsRes.error;
+      if (recordsRes.error) throw recordsRes.error;
+
+      if (settingsRes.data) setSettings(settingsRes.data);
+      if (recordsRes.data) setRecords(recordsRes.data);
+    } catch (err: any) {
+      console.error('Error loading attendance admin data:', err);
+      setDataError('Unable to load attendance records: ' + (err.message || 'Unknown error'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, [selectedDate]);
+
+  // Quick date switches
+  const handleSetToday = () => setSelectedDate(todayStr);
+  const handleSetYesterday = () => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    setSelectedDate(getTodayDateString());
+    // Use manual date calc for yesterday
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(d);
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const day = parts.find((p) => p.type === 'day')?.value;
+    setSelectedDate(`${y}-${m}-${day}`);
+  };
+
+  // Metrics computation for selected date (strictly employee records, excluding admin)
+  const metrics = useMemo(() => {
+    const totalActive = employeeProfiles.length;
+    const checkedInCount = employeeRecords.filter((r) => r.check_in_time).length;
+    const onTimeCount = employeeRecords.filter((r) => r.status === 'present').length;
+    const lateCount = employeeRecords.filter((r) => r.status === 'late').length;
+    const incompleteCount = employeeRecords.filter((r) => r.check_in_time && !r.check_out_time).length;
+    const absentCount = Math.max(0, totalActive - checkedInCount);
+
+    return { totalActive, checkedInCount, onTimeCount, lateCount, incompleteCount, absentCount };
+  }, [employeeProfiles, employeeRecords]);
+
+  // Filtered rows (strictly employees, excluding admin)
+  const filteredEmployees = useMemo(() => {
+    return employeeProfiles.filter((emp) => {
+      // Search filter
+      const matchesSearch =
+        !searchQuery.trim() ||
+        emp.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        emp.email.toLowerCase().includes(searchQuery.toLowerCase());
+
+      // Role filter
+      const matchesRole = roleFilter === 'all' || emp.role === roleFilter;
+
+      // Status filter
+      const matchedRecord = employeeRecords.find((r) => r.profile_id === emp.id);
+      let derivedStatus = 'absent';
+      if (matchedRecord) {
+        if (!matchedRecord.check_out_time && selectedDate < todayStr) {
+          derivedStatus = 'incomplete';
+        } else {
+          derivedStatus = matchedRecord.status;
+        }
+      }
+
+      const matchesStatus = statusFilter === 'all' || derivedStatus === statusFilter;
+
+      return matchesSearch && matchesRole && matchesStatus;
+    });
+  }, [employeeProfiles, employeeRecords, searchQuery, roleFilter, statusFilter, selectedDate, todayStr]);
+
+  return (
+    <div className="page-content">
+      <div className="page-title-row">
+        <div>
+          <span className="section-tag">Office Operations</span>
+          <h1>Attendance</h1>
+          <p className="subtitle">
+            Monitor real-time team presence, office GPS geofence verification, and working hours.
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="outline-button"
+            onClick={() => setShowSettingsModal(true)}
+            style={{ fontSize: 12, padding: '10px 16px' }}
+          >
+            <Settings size={15} />
+            Office Settings
+          </button>
+
+          <button
+            type="button"
+            className="lime-button"
+            onClick={() => setShowManualModal(true)}
+            style={{ fontSize: 12, padding: '10px 16px' }}
+          >
+            <CirclePlus size={15} />
+            Manual Entry
+          </button>
+        </div>
+      </div>
+
+      {/* Date Navigator & Filters Bar */}
+      <div className="filter-bar" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center', marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#ffffff', border: '1px solid #dadad2', padding: '0 12px', height: 42 }}>
+          <Calendar size={15} style={{ color: '#77796f' }} />
+          <input
+            type="date"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            style={{ border: 0, outline: 0, background: 'transparent', fontSize: 13, color: '#20221d', cursor: 'pointer' }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 4 }}>
+          <button
+            type="button"
+            className={`outline-button ${selectedDate === todayStr ? 'active' : ''}`}
+            onClick={handleSetToday}
+            style={{
+              height: 42,
+              padding: '0 14px',
+              fontSize: 12,
+              background: selectedDate === todayStr ? '#20221d' : '#fff',
+              color: selectedDate === todayStr ? '#c3f05a' : '#20221d',
+              borderColor: '#dadad2',
+            }}
+          >
+            Today
+          </button>
+          <button
+            type="button"
+            className="outline-button"
+            onClick={handleSetYesterday}
+            style={{
+              height: 42,
+              padding: '0 14px',
+              fontSize: 12,
+              background: '#fff',
+              color: '#20221d',
+              borderColor: '#dadad2',
+            }}
+          >
+            Yesterday
+          </button>
+        </div>
+
+        <div className="search-box" style={{ height: 42, flex: 1, minWidth: 200 }}>
+          <Search size={15} />
+          <input
+            type="text"
+            placeholder="Search employee by name or email..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+
+        <div className="filter-select" style={{ height: 42 }}>
+          <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="all">All roles</option>
+            <option value="sales">Sales</option>
+            <option value="editor">Editor</option>
+            <option value="script_writer">Script Writer</option>
+            <option value="social_media_manager">Social Media</option>
+            <option value="finance">Finance</option>
+            <option value="employee">Employee</option>
+          </select>
+        </div>
+
+        <div className="filter-select" style={{ height: 42 }}>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">All statuses</option>
+            <option value="present">Present (On Time)</option>
+            <option value="late">Late Arrival</option>
+            <option value="incomplete">Incomplete / Missing Check-Out</option>
+            <option value="absent">Absent / Not Checked In</option>
+            <option value="half_day">Half Day</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Summary Metrics */}
+      <section className="admin-attendance-grid">
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Active Team</span>
+            <UsersRound size={16} />
+          </div>
+          <strong>{metrics.totalActive}</strong>
+          <small>Total active staff</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>On Time</span>
+            <CheckCircle2 size={16} style={{ color: '#43724e' }} />
+          </div>
+          <strong style={{ color: '#386342' }}>{metrics.onTimeCount}</strong>
+          <small>Before threshold ({formatShiftThreshold(settings?.late_threshold_time)})</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Late Arrivals</span>
+            <Clock3 size={16} style={{ color: '#986a30' }} />
+          </div>
+          <strong style={{ color: '#986a30' }}>{metrics.lateCount}</strong>
+          <small>After threshold ({formatShiftThreshold(settings?.late_threshold_time)})</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Incomplete</span>
+            <AlertTriangle size={16} style={{ color: '#99544a' }} />
+          </div>
+          <strong style={{ color: '#99544a' }}>{metrics.incompleteCount}</strong>
+          <small>Missing check-out</small>
+        </div>
+
+        <div className="admin-attendance-metric">
+          <div className="metric-top">
+            <span>Not Checked In</span>
+            <Clock size={16} style={{ color: '#77796f' }} />
+          </div>
+          <strong style={{ color: '#555850' }}>{metrics.absentCount}</strong>
+          <small>No check-in record</small>
+        </div>
+      </section>
+
+      {/* Attendance Table */}
+      {dataError && (
+        <div className="attendance-alert error" style={{ marginBottom: 20 }}>
+          <AlertTriangle size={16} />
+          <span>{dataError}</span>
+          <button type="button" onClick={loadData} className="outline-button" style={{ marginLeft: 'auto', padding: '4px 8px', fontSize: 11 }}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      <div className="lead-table-wrap">
+        {loading ? (
+          <div style={{ padding: '60px 20px', textAlign: 'center' }}>
+            <div className="spinner" style={{ margin: 'auto' }} />
+            <p style={{ marginTop: 12, color: '#77796f', fontSize: 13 }}>Loading attendance records for {selectedDate}...</p>
+          </div>
+        ) : filteredEmployees.length === 0 ? (
+          <div style={{ padding: '60px 20px', textAlign: 'center' }}>
+            <p style={{ color: '#77796f', fontSize: 14 }}>No employee records match the selected filters for {selectedDate}.</p>
+          </div>
+        ) : (
+          <table className="lead-table">
+            <thead>
+              <tr>
+                <th>Employee</th>
+                <th>Status</th>
+                <th>Check-In</th>
+                <th>Check-Out</th>
+                <th>Work Hours</th>
+                <th>Verification & Audit</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredEmployees.map((emp) => {
+                const rec = employeeRecords.find((r) => r.profile_id === emp.id);
+
+                let displayStatus = 'absent';
+                if (rec) {
+                  if (!rec.check_out_time && selectedDate < todayStr) {
+                    displayStatus = 'incomplete';
+                  } else {
+                    displayStatus = rec.status;
+                  }
+                }
+
+                return (
+                  <tr key={emp.id}>
+                    <td>
+                      <div className="table-person">
+                        <div className="small-avatar">{emp.full_name.slice(0, 1).toUpperCase()}</div>
+                        <div>
+                          <strong>{emp.full_name}</strong>
+                          <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span className={`team-role-pill ${emp.role}`} style={{ padding: '2px 6px', fontSize: 9 }}>
+                              {emp.role.split('_').join(' ')}
+                            </span>
+                            <span style={{ color: '#8d9488', fontSize: 11 }}>{emp.email}</span>
+                          </span>
+                        </div>
+                      </div>
+                    </td>
+
+                    <td>
+                      <span className={`att-pill ${displayStatus}`}>
+                        {displayStatus === 'present'
+                          ? 'Present'
+                          : displayStatus === 'late'
+                          ? 'Late Arrival'
+                          : displayStatus === 'incomplete'
+                          ? 'Incomplete'
+                          : displayStatus === 'half_day'
+                          ? 'Half Day'
+                          : 'Not Checked In'}
+                      </span>
+                    </td>
+
+                    <td>
+                      {rec?.check_in_time ? (
+                        <div>
+                          <strong style={{ fontSize: 12, color: '#20221d', display: 'block' }}>
+                            {formatAttendanceTime(rec.check_in_time)}
+                          </strong>
+                          <span style={{ fontSize: 11, color: '#77796f', display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span>{formatDistanceMeters(rec.check_in_distance_meters)}</span>
+                            <span>•</span>
+                            <span>±{Math.round(rec.check_in_accuracy || 0)}m</span>
+                            {rec.check_in_lat && rec.check_in_lng && (
+                              <a
+                                href={`https://www.google.com/maps?q=${rec.check_in_lat},${rec.check_in_lng}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="map-pin-link"
+                                title="View check-in GPS coordinates on Google Maps"
+                              >
+                                <MapPin size={11} />
+                                Map
+                                <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <span style={{ color: '#a3a99f' }}>—</span>
+                      )}
+                    </td>
+
+                    <td>
+                      {rec?.check_out_time ? (
+                        <div>
+                          <strong style={{ fontSize: 12, color: '#20221d', display: 'block' }}>
+                            {formatAttendanceTime(rec.check_out_time)}
+                          </strong>
+                          <span style={{ fontSize: 11, color: '#77796f', display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span>{formatDistanceMeters(rec.check_out_distance_meters)}</span>
+                            {rec.check_out_lat && rec.check_out_lng && (
+                              <a
+                                href={`https://www.google.com/maps?q=${rec.check_out_lat},${rec.check_out_lng}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="map-pin-link"
+                                title="View check-out GPS coordinates on Google Maps"
+                              >
+                                <MapPin size={11} />
+                                Map
+                                <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <span style={{ color: '#a3a99f' }}>—</span>
+                      )}
+                    </td>
+
+                    <td>
+                      <span style={{ font: "12px 'DM Mono', monospace", color: '#30342d' }}>
+                        {calculateWorkDuration(rec?.check_in_time, rec?.check_out_time)}
+                      </span>
+                    </td>
+
+                    <td>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        {rec ? (
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <span className={`att-pill ${rec.verification_status}`}>
+                              {rec.verification_status === 'verified'
+                                ? 'GPS Verified'
+                                : rec.verification_status === 'flagged'
+                                ? 'GPS Flagged'
+                                : rec.verification_status === 'manual_override'
+                                ? 'Manual Override'
+                                : rec.verification_status}
+                            </span>
+                            {rec.is_corrected && (
+                              <span
+                                className="att-pill manual"
+                                title={rec.correction_reason || 'Record corrected by Admin'}
+                              >
+                                Audited
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 11, color: '#8c9388' }}>Unrecorded</span>
+                        )}
+
+                        {rec?.is_corrected && rec.correction_reason && (
+                          <span style={{ fontSize: 10, color: '#77796f', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={rec.correction_reason}>
+                            Reason: {rec.correction_reason}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    <td style={{ textAlign: 'right' }}>
+                      <button
+                        type="button"
+                        className="outline-button"
+                        style={{ padding: '5px 10px', fontSize: 11 }}
+                        onClick={() => setSelectedCorrection({ record: rec, profile: emp, date: selectedDate })}
+                      >
+                        {rec ? 'Correct' : 'Mark'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Auditable Attendance Correction Modal */}
+      {selectedCorrection && (
+        <AttendanceCorrectionModal
+          target={selectedCorrection}
+          settings={settings}
+          onClose={() => setSelectedCorrection(null)}
+          onSuccess={() => {
+            setSelectedCorrection(null);
+            loadData();
+          }}
+        />
+      )}
+
+      {/* Office & Geofence Settings Modal */}
+      {showSettingsModal && (
+        <AttendanceSettingsModal
+          settings={settings}
+          onClose={() => setShowSettingsModal(false)}
+          onSuccess={(newSettings) => {
+            setSettings(newSettings);
+            setShowSettingsModal(false);
+          }}
+        />
+      )}
+
+      {/* Manual Entry Modal */}
+      {showManualModal && (
+        <AttendanceManualEntryModal
+          profiles={employeeProfiles}
+          defaultDate={selectedDate}
+          onClose={() => setShowManualModal(false)}
+          onSuccess={() => {
+            setShowManualModal(false);
+            loadData();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// AUDITABLE ATTENDANCE CORRECTION MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceCorrectionModal({
+  target,
+  settings,
+  onClose,
+  onSuccess,
+}: {
+  target: { record?: AttendanceRecord; profile: Profile; date: string };
+  settings: AttendanceSettings | null;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const { record, profile, date } = target;
+  const isEditing = !!record;
+
+  const [status, setStatus] = useState<AttendanceRecord['status']>(record?.status || 'present');
+  const [checkInTime, setCheckInTime] = useState<string>(() => {
+    if (!record?.check_in_time) return '09:30';
+    const d = new Date(record.check_in_time);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  });
+  const [checkOutTime, setCheckOutTime] = useState<string>(() => {
+    if (!record?.check_out_time) return '';
+    const d = new Date(record.check_out_time);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  });
+  const [reason, setReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (reason.trim().length < 5) {
+      setError('A detailed correction reason (minimum 5 characters) is mandatory for audit trail compliance.');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      // Build ISO timestamps in UTC corresponding to the date and time in Asia/Kolkata
+      let checkInIso: string | null = null;
+      let checkOutIso: string | null = null;
+
+      if (checkInTime) {
+        checkInIso = new Date(`${date}T${checkInTime}:00+05:30`).toISOString();
+      }
+      if (checkOutTime) {
+        checkOutIso = new Date(`${date}T${checkOutTime}:00+05:30`).toISOString();
+      }
+
+      if (isEditing && record) {
+        const { error: rpcError } = await supabase.rpc('admin_correct_attendance', {
+          p_record_id: record.id,
+          p_status: status,
+          p_check_in_time: checkInIso,
+          p_check_out_time: checkOutIso,
+          p_reason: reason.trim(),
+        });
+        if (rpcError) throw rpcError;
+      } else {
+        const { error: rpcError } = await supabase.rpc('admin_create_attendance_record', {
+          p_employee_id: profile.id,
+          p_attendance_date: date,
+          p_status: status,
+          p_check_in_time: checkInIso,
+          p_check_out_time: checkOutIso,
+          p_reason: reason.trim(),
+        });
+        if (rpcError) throw rpcError;
+      }
+
+      onSuccess();
+    } catch (err: any) {
+      setError(err.message || 'Failed to apply attendance adjustment.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 540 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Audited Correction</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>
+              {isEditing ? 'Adjust Attendance' : 'Mark Manual Attendance'}
+            </h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              Employee: <strong>{profile.full_name}</strong> • Date: <strong>{date}</strong>
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Audit Notice */}
+        <div style={{ padding: '10px 14px', background: '#fcf8ee', border: '1px solid #ebd9b5', borderRadius: 6, fontSize: 11, color: '#7a5a22', marginBottom: 18 }}>
+          <strong>Immutable Audit Trail:</strong> Original GPS coordinates, distances, and server timestamps are permanently retained in the audit history.
+        </div>
+
+        {/* Existing Evidence Display */}
+        {record && (
+          <div style={{ padding: '12px 14px', background: '#f5f7f2', border: '1px solid #dce0d5', borderRadius: 6, fontSize: 12, marginBottom: 18 }}>
+            <div style={{ fontWeight: 600, color: '#33382d', marginBottom: 6 }}>Recorded Evidence:</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, color: '#687064' }}>
+              <div>Original Check-In: <strong>{formatAttendanceTime(record.check_in_time)}</strong></div>
+              <div>Original Check-Out: <strong>{formatAttendanceTime(record.check_out_time)}</strong></div>
+              <div>Office Distance: <strong>{formatDistanceMeters(record.check_in_distance_meters)}</strong></div>
+              <div>GPS Accuracy: <strong>±{Math.round(record.check_in_accuracy || 0)}m</strong></div>
+            </div>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Attendance Status</label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value as any)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              >
+                <option value="present">Present (On Time)</option>
+                <option value="late">Late Arrival</option>
+                <option value="half_day">Half Day</option>
+                <option value="incomplete">Incomplete</option>
+                <option value="absent">Absent</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Shift Threshold</label>
+              <input
+                type="text"
+                disabled
+                value={formatShiftThreshold(settings?.late_threshold_time)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#f5f5f4', fontSize: 13, color: '#78716c' }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-In Time</label>
+              <input
+                type="time"
+                value={checkInTime}
+                onChange={(e) => setCheckInTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-Out Time</label>
+              <input
+                type="time"
+                value={checkOutTime}
+                onChange={(e) => setCheckOutTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>
+              Correction Reason <span style={{ color: '#99544a' }}>*</span>
+            </label>
+            <textarea
+              required
+              rows={3}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Approved on-duty client visit; GPS device malfunction verified in person..."
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13, resize: 'vertical' }}
+            />
+            <small style={{ color: '#77796f', fontSize: 10 }}>Minimum 5 characters. Stored permanently in audit log.</small>
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Saving Correction…' : 'Save Correction'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// OFFICE & GEOFENCE SETTINGS MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceSettingsModal({
+  settings,
+  onClose,
+  onSuccess,
+}: {
+  settings: AttendanceSettings | null;
+  onClose: () => void;
+  onSuccess: (updated: AttendanceSettings) => void;
+}) {
+  const [address, setAddress] = useState(
+    settings?.office_address || '2/116, Daya Sadan Main Road, Pallavan Nagar, Koyambedu, Chennai, Tamil Nadu 600107, India'
+  );
+  const [lat, setLat] = useState(settings?.office_lat?.toString() || '13.0693169');
+  const [lng, setLng] = useState(settings?.office_lng?.toString() || '80.1814571');
+  const [radius, setRadius] = useState(settings?.geofence_radius_meters?.toString() || '100');
+  const [timezone, setTimezone] = useState(settings?.timezone || 'Asia/Kolkata');
+  const [lateTime, setLateTime] = useState(settings?.late_threshold_time || '10:00:00');
+  const [maxAccuracy, setMaxAccuracy] = useState(settings?.max_gps_accuracy_meters?.toString() || '150');
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const parsedLat = parseFloat(lat);
+      const parsedLng = parseFloat(lng);
+      const parsedRadius = parseInt(radius, 10);
+      const parsedMaxAccuracy = parseFloat(maxAccuracy);
+
+      if (isNaN(parsedLat) || parsedLat < -90 || parsedLat > 90) throw new Error('Invalid latitude.');
+      if (isNaN(parsedLng) || parsedLng < -180 || parsedLng > 180) throw new Error('Invalid longitude.');
+      if (isNaN(parsedRadius) || parsedRadius < 10) throw new Error('Geofence radius must be at least 10 metres.');
+      if (isNaN(parsedMaxAccuracy) || parsedMaxAccuracy < 10) throw new Error('Max accuracy threshold must be at least 10 metres.');
+
+      const payload = {
+        office_address: address.trim(),
+        office_lat: parsedLat,
+        office_lng: parsedLng,
+        geofence_radius_meters: parsedRadius,
+        timezone: timezone.trim(),
+        late_threshold_time: lateTime,
+        max_gps_accuracy_meters: parsedMaxAccuracy,
+        updated_at: new Date().toISOString(),
+      };
+
+      const { data, error: updateError } = await supabase
+        .from('attendance_settings')
+        .update(payload)
+        .eq('id', 'default')
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+      onSuccess(data);
+    } catch (err: any) {
+      setError(err.message || 'Failed to save office settings.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 560 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Location & Policy</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>Office Geofence Settings</h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              These parameters are stored securely in Supabase and enforced server-side on all check-ins.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Registered Office Address</label>
+            <input
+              type="text"
+              required
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+            />
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Latitude</label>
+              <input
+                type="number"
+                step="any"
+                required
+                value={lat}
+                onChange={(e) => setLat(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Longitude</label>
+              <input
+                type="number"
+                step="any"
+                required
+                value={lng}
+                onChange={(e) => setLng(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Geofence Radius (metres)</label>
+              <input
+                type="number"
+                min="10"
+                max="5000"
+                required
+                value={radius}
+                onChange={(e) => setRadius(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Standard: 100 metres</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Late Arrival Threshold</label>
+              <input
+                type="time"
+                step="1"
+                required
+                value={lateTime.slice(0, 5)}
+                onChange={(e) => setLateTime(`${e.target.value}:00`)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Default: 10:00 AM IST</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Timezone</label>
+              <input
+                type="text"
+                required
+                value={timezone}
+                onChange={(e) => setTimezone(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Default: Asia/Kolkata</small>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Max GPS Accuracy (metres)</label>
+              <input
+                type="number"
+                min="20"
+                max="1000"
+                required
+                value={maxAccuracy}
+                onChange={(e) => setMaxAccuracy(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+              <small style={{ color: '#77796f', fontSize: 10 }}>Rejects readings worse than ±150m</small>
+            </div>
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Saving…' : 'Save Settings'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// MANUAL ATTENDANCE ENTRY MODAL
+// ----------------------------------------------------------------------------
+
+function AttendanceManualEntryModal({
+  profiles,
+  defaultDate,
+  onClose,
+  onSuccess,
+}: {
+  profiles: Profile[];
+  defaultDate: string;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const selectableProfiles = useMemo(
+    () => profiles.filter((p) => p.is_active && p.role !== 'admin'),
+    [profiles]
+  );
+  const [employeeId, setEmployeeId] = useState(selectableProfiles[0]?.id || '');
+  const [date, setDate] = useState(defaultDate);
+  const [status, setStatus] = useState<AttendanceRecord['status']>('present');
+  const [checkInTime, setCheckInTime] = useState('09:30');
+  const [checkOutTime, setCheckOutTime] = useState('18:00');
+  const [reason, setReason] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!employeeId) {
+      setError('Please select an employee.');
+      return;
+    }
+    if (reason.trim().length < 5) {
+      setError('A detailed reason (minimum 5 characters) is required.');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      let checkInIso: string | null = null;
+      let checkOutIso: string | null = null;
+      if (checkInTime) {
+        checkInIso = new Date(`${date}T${checkInTime}:00+05:30`).toISOString();
+      }
+      if (checkOutTime) {
+        checkOutIso = new Date(`${date}T${checkOutTime}:00+05:30`).toISOString();
+      }
+
+      const { error: rpcError } = await supabase.rpc('admin_create_attendance_record', {
+        p_employee_id: employeeId,
+        p_attendance_date: date,
+        p_status: status,
+        p_check_in_time: checkInIso,
+        p_check_out_time: checkOutIso,
+        p_reason: reason.trim(),
+      });
+
+      if (rpcError) throw rpcError;
+      onSuccess();
+    } catch (err: any) {
+      setError(err.message || 'Failed to create manual attendance entry.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <section className="confirm-dialog" style={{ maxWidth: 540 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+          <div>
+            <span className="eyebrow">Manual Override</span>
+            <h2 style={{ margin: '4px 0 0', fontSize: 18, fontWeight: 700 }}>Record Manual Attendance</h2>
+            <p style={{ margin: '4px 0 0', fontSize: 12, color: '#77796f' }}>
+              Create an attendance record for staff on approved leave, client site visit, or missing device entry.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} style={{ border: 0, background: 'none', cursor: 'pointer', color: '#77796f' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Employee</label>
+            <select
+              required
+              value={employeeId}
+              onChange={(e) => setEmployeeId(e.target.value)}
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+            >
+              {selectableProfiles.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.full_name} ({p.role.split('_').join(' ')}) — {p.email}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Attendance Date</label>
+              <input
+                type="date"
+                required
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Status</label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value as any)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              >
+                <option value="present">Present (On Time)</option>
+                <option value="late">Late Arrival</option>
+                <option value="half_day">Half Day</option>
+                <option value="absent">Absent</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-In Time</label>
+              <input
+                type="time"
+                value={checkInTime}
+                onChange={(e) => setCheckInTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>Check-Out Time</label>
+              <input
+                type="time"
+                value={checkOutTime}
+                onChange={(e) => setCheckOutTime(e.target.value)}
+                style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13 }}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#515850', marginBottom: 6 }}>
+              Reason for Manual Entry <span style={{ color: '#99544a' }}>*</span>
+            </label>
+            <textarea
+              required
+              rows={3}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Employee visited client on-site in Guindy with director approval..."
+              style={{ width: '100%', padding: '10px 12px', border: '1px solid #dadad2', background: '#fff', fontSize: 13, resize: 'vertical' }}
+            />
+          </div>
+
+          {error && (
+            <div className="attendance-alert error" style={{ marginBottom: 16 }}>
+              <AlertTriangle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="drawer-footer" style={{ borderTop: '1px solid #dadad2', paddingTop: 16 }}>
+            <button type="button" className="outline-button" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button type="submit" className="lime-button" disabled={loading}>
+              {loading ? 'Creating Entry…' : 'Record Entry'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 type MetaLeadForm = {
   id: string;
   name: string;
+  meta_form_name?: string;
   status?: string;
   connection_status?: 'saved' | 'connected' | 'receiving_leads';
   page_id?: string;
+  verified_page_id?: string;
+  verified_at?: string;
+  verified_by?: string;
+  verification_sig?: string;
   source_url?: string;
   created_at?: string;
+  updated_at?: string;
 };
 
 type AgencySettings = {
@@ -2660,8 +4496,20 @@ function SettingsPage({
   const [removeLogo, setRemoveLogo] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Meta Instant Form placeholder state
+  // Meta Instant Form manager state
   const [instantFormLink, setInstantFormLink] = useState('');
+  const [instantFormName, setInstantFormName] = useState('');
+  const [verifyingForm, setVerifyingForm] = useState(false);
+  const [formFeedback, setFormFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [editingFormId, setEditingFormId] = useState<string | null>(null);
+  const [editingFormName, setEditingFormName] = useState('');
+  const [formActionInProgress, setFormActionInProgress] = useState<string | null>(null);
+
+  // Real-time link validation and ID extraction
+  const parsedFormLink = useMemo(() => {
+    if (!instantFormLink.trim()) return null;
+    return parseMetaInstantFormUrl(instantFormLink);
+  }, [instantFormLink]);
 
   // General state
   const [loading, setLoading] = useState(true);
@@ -2883,6 +4731,202 @@ function SettingsPage({
       setRemoveLogo(false);
     }
     setShowCancelModal(false);
+  };
+
+  // Meta Lead Form Manager actions via Admin backend service
+  const handleAddForm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!instantFormLink.trim()) return;
+
+    setVerifyingForm(true);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
+        body: {
+          action: 'verify_and_register_meta_form',
+          form_url: instantFormLink.trim(),
+          custom_name: instantFormName.trim(),
+        },
+      });
+
+      if (fnError || !data?.success) {
+        const errorMsg = data?.error || fnError?.message || 'Verification failed.';
+        setFormFeedback({
+          type: 'error',
+          message: errorMsg,
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || `Form verified with Meta and registered successfully.`,
+      });
+      setInstantFormLink('');
+      setInstantFormName('');
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      console.error('Error verifying form:', err);
+      setFormFeedback({
+        type: 'error',
+        message: err.message || 'An unexpected error occurred during form verification.',
+      });
+    } finally {
+      setVerifyingForm(false);
+    }
+  };
+
+  const handleToggleFormStatus = async (formItem: MetaLeadForm) => {
+    setFormActionInProgress(formItem.id);
+    setFormFeedback(null);
+    try {
+      // If form is unverified or missing cryptographic signature, route to verify_and_register_meta_form
+      if (!formItem.verification_sig) {
+        const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+          method: 'PATCH',
+          body: {
+            action: 'verify_and_register_meta_form',
+            form_id: formItem.id,
+            custom_name: formItem.name,
+          },
+        });
+
+        if (fnError || !data?.success) {
+          setFormFeedback({
+            type: 'error',
+            message: data?.error || fnError?.message || 'Failed to verify and sign form with Meta.',
+          });
+          return;
+        }
+
+        setFormFeedback({
+          type: 'success',
+          message: data.message || 'Form verified with Meta and sealed successfully.',
+        });
+        if (data.forms && settings) {
+          setSettings({ ...settings, meta_lead_forms: data.forms });
+        } else {
+          await loadSettings();
+        }
+        return;
+      }
+
+      const nextStatus = formItem.status === 'active' ? 'inactive' : 'active';
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
+        body: {
+          action: 'set_meta_form_status',
+          form_id: formItem.id,
+          status: nextStatus,
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to update form status.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || `Form status updated to ${nextStatus}.`,
+      });
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error updating form status.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
+  };
+
+  const handleSaveRename = async (formId: string) => {
+    if (!editingFormName.trim()) return;
+    setFormActionInProgress(formId);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
+        body: {
+          action: 'rename_meta_form',
+          form_id: formId,
+          new_name: editingFormName.trim(),
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to rename form.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || 'Form renamed successfully.',
+      });
+      setEditingFormId(null);
+      setEditingFormName('');
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error renaming form.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
+  };
+
+  const handleRemoveForm = async (formItem: MetaLeadForm) => {
+    if (!window.confirm(`Are you sure you want to deactivate and remove '${formItem.name}' (${formItem.id}) from the active forms list? Historical leads will remain intact.`)) {
+      return;
+    }
+    setFormActionInProgress(formItem.id);
+    setFormFeedback(null);
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
+        body: {
+          action: 'remove_meta_form',
+          form_id: formItem.id,
+        },
+      });
+
+      if (fnError || !data?.success) {
+        setFormFeedback({
+          type: 'error',
+          message: data?.error || fnError?.message || 'Failed to deactivate form.',
+        });
+        return;
+      }
+
+      setFormFeedback({
+        type: 'success',
+        message: data.message || 'Form deactivated and removed from active list.',
+      });
+      if (data.forms && settings) {
+        setSettings({ ...settings, meta_lead_forms: data.forms });
+      } else {
+        await loadSettings();
+      }
+    } catch (err: any) {
+      setFormFeedback({ type: 'error', message: err.message || 'Error deactivating form.' });
+    } finally {
+      setFormActionInProgress(null);
+    }
   };
 
 
@@ -3156,36 +5200,207 @@ function SettingsPage({
           {activeSection === 'integrations' && (
             <div>
               <div className="settings-section-header">
-                <h2>Meta Instant Form</h2>
-                <p>Add an Instant Form link for future lead integration.</p>
+                <h2>Meta Instant Form Manager</h2>
+                <p>Register, verify, and manage Facebook Instant Forms authorized to feed sales leads into Taha Media.</p>
               </div>
 
+              {formFeedback && (
+                <div className={`settings-alert ${formFeedback.type === 'error' ? 'error' : 'success'}`} style={{ marginBottom: 18 }}>
+                  {formFeedback.type === 'error' ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}
+                  <span>{formFeedback.message}</span>
+                </div>
+              )}
+
+              {/* Add Form Link Card */}
               <div className="meta-link-input-card">
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!instantFormLink.trim()) return;
-                    setInstantFormLink('');
-                  }}
-                  className="meta-link-input-row"
-                >
+                <form onSubmit={handleAddForm} className="meta-link-input-row">
                   <div className="meta-link-input-fields">
                     <input
                       type="text"
-                      placeholder="Paste Meta Instant Form link"
+                      placeholder="Paste Meta Instant Form link or numeric Form ID"
                       value={instantFormLink}
                       onChange={(e) => setInstantFormLink(e.target.value)}
+                      disabled={verifyingForm}
                     />
+                    <input
+                      type="text"
+                      placeholder="Custom display name (e.g. Client Enquiry Form)"
+                      value={instantFormName}
+                      onChange={(e) => setInstantFormName(e.target.value)}
+                      disabled={verifyingForm}
+                    />
+
+                    {parsedFormLink && (
+                      <div style={{ marginTop: 2 }}>
+                        {parsedFormLink.isValid ? (
+                          <span className="meta-detection-pill valid">
+                            <Check size={12} />
+                            Detected Form ID: <code>{parsedFormLink.formId}</code>
+                            {parsedFormLink.pageId && ` (Page: ${parsedFormLink.pageId})`}
+                          </span>
+                        ) : (
+                          <span className="meta-detection-pill invalid">
+                            <AlertTriangle size={12} />
+                            {parsedFormLink.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
+
                   <button
                     type="submit"
                     className="lime-button"
                     style={{ minHeight: 40, whiteSpace: 'nowrap' }}
+                    disabled={verifyingForm || !instantFormLink.trim() || (parsedFormLink !== null && !parsedFormLink.isValid)}
                   >
                     <Plus size={15} />
-                    <span>Add Form</span>
+                    <span>{verifyingForm ? 'Verifying with Meta…' : 'Add Form'}</span>
                   </button>
                 </form>
+              </div>
+
+              {/* Approved Instant Forms Listing */}
+              <div className="lead-forms-section">
+                <div className="lead-forms-header" style={{ marginBottom: 14 }}>
+                  <div>
+                    <h3 style={{ fontSize: 15, fontWeight: 600, margin: '0 0 4px', color: '#20221d' }}>Approved Instant Forms</h3>
+                    <p style={{ fontSize: 12, color: '#687064', margin: 0 }}>
+                      Only active forms verified to belong to Taha Media Page <code>104523992487431</code> create CRM leads.
+                    </p>
+                  </div>
+                </div>
+
+                {(!settings?.meta_lead_forms || settings.meta_lead_forms.length === 0) ? (
+                  <div className="empty-state-box" style={{ padding: '30px 20px', textAlign: 'center', background: '#fafbf8', borderRadius: 8, border: '1px dashed #dcdfd5' }}>
+                    <p style={{ margin: 0, color: '#687064', fontSize: 13 }}>No approved Instant Forms registered yet. Paste a Meta Form link above to register your first campaign form.</p>
+                  </div>
+                ) : (
+                  <div className="meta-forms-list" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {settings.meta_lead_forms.map((formItem) => {
+                      const isEditing = editingFormId === formItem.id;
+                      const isSigned = !!(formItem.verification_sig && formItem.verification_sig.trim());
+                      const isActive = formItem.status === 'active' && isSigned;
+                      const isBusy = formActionInProgress === formItem.id;
+
+                      return (
+                        <div key={formItem.id} className="meta-form-row">
+                          <div className="meta-form-info" style={{ flex: 1 }}>
+                            <div className="meta-form-icon">
+                              <FileText size={16} />
+                            </div>
+                            <div className="meta-form-text" style={{ flex: 1 }}>
+                              {isEditing ? (
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+                                  <input
+                                    type="text"
+                                    value={editingFormName}
+                                    onChange={(e) => setEditingFormName(e.target.value)}
+                                    style={{ fontSize: 13, padding: '4px 8px', maxWidth: 280 }}
+                                    autoFocus
+                                  />
+                                  <button
+                                    type="button"
+                                    className="lime-button"
+                                    style={{ padding: '4px 10px', fontSize: 11, minHeight: 28 }}
+                                    disabled={isBusy || !editingFormName.trim()}
+                                    onClick={() => handleSaveRename(formItem.id)}
+                                  >
+                                    Save
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="outline-button"
+                                    style={{ padding: '4px 10px', fontSize: 11, minHeight: 28 }}
+                                    disabled={isBusy}
+                                    onClick={() => setEditingFormId(null)}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <>
+                                  <div className="meta-form-name-row">
+                                    <strong style={{ fontSize: 13, color: '#20221d' }}>{formItem.name}</strong>
+                                    {formItem.meta_form_name && formItem.meta_form_name !== formItem.name && (
+                                      <small style={{ fontSize: 11, color: '#7b8375' }}>({formItem.meta_form_name})</small>
+                                    )}
+                                  </div>
+                                  <div className="meta-form-id-meta">
+                                    <span>Form ID: <code>{formItem.id}</code></span>
+                                    <span>•</span>
+                                    <span>Page: <code>{formItem.verified_page_id || formItem.page_id || '104523992487431'}</code></span>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="meta-form-actions" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            {!isSigned ? (
+                              <span className="system-status-pill unverified" title="Missing cryptographic verification signature. Must be verified with Meta to activate.">
+                                Unverified
+                              </span>
+                            ) : (
+                              <span className={`system-status-pill ${isActive ? 'verified' : 'unverified'}`}>
+                                {isActive ? 'Active' : 'Inactive'}
+                              </span>
+                            )}
+
+                            <button
+                              type="button"
+                              className="outline-button"
+                              style={{ fontSize: 11, padding: '4px 10px', minHeight: 28 }}
+                              disabled={isBusy}
+                              onClick={() => handleToggleFormStatus(formItem)}
+                              title={!isSigned ? 'Verify and sign form with Meta' : (isActive ? 'Deactivate form' : 'Activate form')}
+                            >
+                              {!isSigned ? 'Verify' : (isActive ? 'Deactivate' : 'Activate')}
+                            </button>
+
+                            {!isEditing && (
+                              <button
+                                type="button"
+                                className="icon-button"
+                                title="Rename form"
+                                disabled={isBusy}
+                                onClick={() => {
+                                  setEditingFormId(formItem.id);
+                                  setEditingFormName(formItem.name);
+                                }}
+                              >
+                                <Edit2 size={14} style={{ color: '#4a5240' }} />
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              className="icon-button"
+                              title="Remove form from active list"
+                              disabled={isBusy}
+                              onClick={() => handleRemoveForm(formItem)}
+                            >
+                              <Trash2 size={14} style={{ color: '#99544a' }} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="meta-info-card">
+                  <div className="meta-info-card-icon">
+                    <ShieldCheck size={20} />
+                  </div>
+                  <div className="meta-info-card-content">
+                    <h4>Cryptographic Whitelist Protection</h4>
+                    <p>
+                      Every approved form is verified with Meta Graph API v26.0 and sealed with a backend cryptographic signature.
+                      Submissions from unapproved, deactivated, or foreign-page forms are automatically discarded to prevent recruitment or irrelevant forms from entering your sales pipeline.
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
           )}

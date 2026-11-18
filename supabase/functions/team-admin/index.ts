@@ -59,6 +59,89 @@ function randomPassword(length = 16) {
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
+const TAHA_PAGE_ID = "104523992487431";
+const FORM_ID_REGEX = /^\d{14,18}$/;
+
+interface VerifiedMetaLeadForm {
+  id: string;
+  name: string;
+  meta_form_name: string;
+  status: "active" | "inactive";
+  page_id: string;
+  verified_page_id: string;
+  verified_at: string;
+  verified_by: string;
+  verification_sig: string;
+  source_url?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+/**
+ * Deterministic Canonical JSON stringification for HMAC signing.
+ * Strictly ordered keys (ASCII order):
+ * id, meta_form_name, status, verified_at, verified_by, verified_page_id
+ */
+function canonicalizeFormPayload(data: {
+  id: string;
+  meta_form_name: string;
+  status: "active" | "inactive";
+  verified_at: string;
+  verified_by: string;
+  verified_page_id: string;
+}): string {
+  return JSON.stringify({
+    id: String(data.id || "").trim(),
+    meta_form_name: String(data.meta_form_name || "").trim(),
+    status: data.status,
+    verified_at: String(data.verified_at || "").trim(),
+    verified_by: String(data.verified_by || "").trim(),
+    verified_page_id: String(data.verified_page_id || "").trim(),
+  });
+}
+
+/**
+ * Computes HMAC-SHA256 hex signature using Web Crypto API.
+ */
+async function computeFormRegistryHmac(
+  canonicalPayload: string,
+  secretKey: string
+): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secretKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(canonicalPayload));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Extracts 14-18 digit Meta Form ID from URLs, query params, or direct numeric string.
+ */
+function extractFormId(input: string): string | null {
+  if (!input) return null;
+  const raw = input.trim();
+  if (FORM_ID_REGEX.test(raw)) return raw;
+
+  const qMatch = raw.match(/[?&](?:id|form_id|selected_form_id)=(\d{14,18})/i);
+  if (qMatch) return qMatch[1];
+
+  const pMatch = raw.match(/\/(?:forms|leadgen)\/(\d{14,18})/i);
+  if (pMatch) return pMatch[1];
+
+  if (/facebook\.com|fb\.me|meta\.com|instagram\.com/i.test(raw)) {
+    const fbMatch = raw.match(/\b(\d{14,18})\b/);
+    if (fbMatch) return fbMatch[1];
+  }
+
+  return null;
+}
 
 /**
  * Checks for email collision across all auth users via pagination,
@@ -178,9 +261,520 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // PATCH — update role, toggle active status, or update credentials
-    if (req.method === "PATCH") {
-      const body = await req.json();
+    // PATCH or DELETE — employee account management OR Meta Lead Form management
+    if (req.method === "PATCH" || req.method === "DELETE") {
+      let body: any = {};
+      try {
+        body = await req.json();
+      } catch {
+        body = {};
+      }
+      if (req.method === "DELETE" && !body.action) {
+        body.action = "delete_employee";
+      }
+      if (req.method === "DELETE" && !body.user_id) {
+        try {
+          const url = new URL(req.url);
+          body.user_id = url.searchParams.get("user_id") || "";
+        } catch {
+          // ignore
+        }
+      }
+
+      // ==========================================
+      // Meta Lead Form Registry Actions (Admin-only)
+      // ==========================================
+
+      // 1. Verify with Meta Graph API v26.0 and Register Form
+      if (body.action === "verify_and_register_meta_form") {
+        const rawUrl = typeof body.form_url === "string" ? body.form_url.trim() : (typeof body.form_id === "string" ? body.form_id.trim() : "");
+        const customName = typeof body.custom_name === "string" ? body.custom_name.trim() : "";
+
+        if (!rawUrl) return errorResponse("Meta Instant Form URL or Form ID is required.", 400);
+
+        const formId = extractFormId(rawUrl);
+        if (!formId || !FORM_ID_REGEX.test(formId)) {
+          return errorResponse("Could not detect a valid 14-18 digit Meta Form ID from the provided link.", 400);
+        }
+
+        // Require META_FORM_REGISTRY_HMAC_SECRET (Fail-closed)
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse(
+            "Cryptographic signing key (META_FORM_REGISTRY_HMAC_SECRET) is not configured in Supabase Secrets. Cannot register form without cryptographic sealing.",
+            500
+          );
+        }
+
+        // Check if META_PAGE_ACCESS_TOKEN is configured
+        const metaToken = Deno.env.get("META_PAGE_ACCESS_TOKEN");
+        if (!metaToken || !metaToken.trim()) {
+          // Rule: If a real Meta API verification requires a token that is not available locally,
+          // implement the backend integration safely and report that live verification remains pending.
+          // Do not fake a successful verification.
+          return json({
+            success: false,
+            verified: false,
+            error: "Meta verification token (META_PAGE_ACCESS_TOKEN) is not configured in Supabase Secrets. Live Meta Graph API verification remains pending.",
+            form_id: formId,
+          }, 503);
+        }
+
+        // Live verification with Meta Graph API v26.0
+        const metaApiUrl = `https://graph.facebook.com/v26.0/${formId}?fields=id,name,status,page{id,name}&access_token=${encodeURIComponent(metaToken.trim())}`;
+        let metaData: any;
+        try {
+          const metaRes = await fetch(metaApiUrl);
+          metaData = await metaRes.json();
+          if (!metaRes.ok || metaData.error) {
+            const errMsg = metaData.error?.message || `Meta Graph API returned HTTP ${metaRes.status}`;
+            return errorResponse(`Meta verification failed: ${errMsg}`, 400);
+          }
+        } catch (fetchErr: any) {
+          console.error("Meta Graph API fetch exception:", fetchErr);
+          return errorResponse(`Failed to connect to Meta Graph API: ${fetchErr.message || fetchErr}`, 502);
+        }
+
+        // Verify Page ownership
+        const pageId = metaData.page?.id ? String(metaData.page.id).trim() : null;
+        const pageName = metaData.page?.name ? String(metaData.page.name).trim() : "Unknown Page";
+        if (pageId !== TAHA_PAGE_ID) {
+          return errorResponse(
+            `Form verification failed: Form belongs to Page '${pageId}' (${pageName}), not Taha Media Page (${TAHA_PAGE_ID}).`,
+            400
+          );
+        }
+
+        // Verify Status is ACTIVE
+        const formStatus = metaData.status ? String(metaData.status).trim().toUpperCase() : "";
+        if (formStatus !== "ACTIVE") {
+          return errorResponse(
+            `Form verification failed: Form status is '${formStatus}'. Only ACTIVE Meta Instant Forms can be registered.`,
+            400
+          );
+        }
+
+        const metaFormName = metaData.name ? String(metaData.name).trim() : (customName || "Taha Media Form");
+        const displayName = customName || metaFormName;
+        const nowIso = new Date().toISOString();
+
+        // Sign with META_FORM_REGISTRY_HMAC_SECRET
+        const payloadToSign = canonicalizeFormPayload({
+          id: formId,
+          meta_form_name: metaFormName,
+          status: "active",
+          verified_at: nowIso,
+          verified_by: admin.id,
+          verified_page_id: TAHA_PAGE_ID,
+        });
+
+        const verificationSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+        if (!verificationSig) {
+          return errorResponse("Failed to compute cryptographic signature for form.", 500);
+        }
+
+        // Fetch existing forms array targeting default row
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
+          .from("agency_settings")
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
+          .maybeSingle();
+
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) {
+            return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          }
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        // Check if form already exists
+        const existingIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        const newRecord: VerifiedMetaLeadForm = {
+          id: formId,
+          name: displayName,
+          meta_form_name: metaFormName,
+          status: "active",
+          page_id: TAHA_PAGE_ID,
+          verified_page_id: TAHA_PAGE_ID,
+          verified_at: nowIso,
+          verified_by: admin.id,
+          verification_sig: verificationSig,
+          source_url: rawUrl.startsWith("http") ? rawUrl : undefined,
+          created_at: existingIdx >= 0 ? existingForms[existingIdx].created_at || nowIso : nowIso,
+          updated_at: nowIso,
+        };
+
+        let updatedList: VerifiedMetaLeadForm[];
+        if (existingIdx >= 0) {
+          updatedList = [...existingForms];
+          updatedList[existingIdx] = newRecord;
+        } else {
+          updatedList = [...existingForms, newRecord];
+        }
+
+        // Update agency_settings with service_role client
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", targetSettingsId);
+
+        if (updateErr) {
+          return errorResponse("Failed to save verified form to registry: " + updateErr.message, 500);
+        }
+
+        return json({
+          success: true,
+          verified: true,
+          message: `Form '${displayName}' verified with Meta Page ${TAHA_PAGE_ID} and registered successfully.`,
+          form: newRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 2. Set Status (Activate / Deactivate) with HMAC re-signing & tamper check
+      if (body.action === "set_meta_form_status") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        const nextStatus = body.status === "active" ? "active" : (body.status === "inactive" ? "inactive" : null);
+
+        if (!formId || !FORM_ID_REGEX.test(formId)) {
+          return errorResponse("Valid Form ID is required.", 400);
+        }
+        if (!nextStatus) {
+          return errorResponse("status must be 'active' or 'inactive'.", 400);
+        }
+
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse(
+            "Cryptographic signing key (META_FORM_REGISTRY_HMAC_SECRET) is not configured in Supabase Secrets. Cannot update form status.",
+            500
+          );
+        }
+
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
+          .from("agency_settings")
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
+          .maybeSingle();
+
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) {
+          return errorResponse("Form ID not found in registry.", 404);
+        }
+
+        const target = existingForms[targetIdx];
+
+        // Anti-tampering check: Form must have an existing valid signature before status transition
+        if (!target.verification_sig || typeof target.verification_sig !== "string" || !target.verification_sig.trim()) {
+          return errorResponse(
+            "Cannot update status: Form record is unsigned or missing cryptographic verification. It must be re-verified through Meta Graph API before activating.",
+            403
+          );
+        }
+
+        const existingCanonical = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: target.meta_form_name || target.name,
+          status: target.status,
+          verified_at: target.verified_at,
+          verified_by: target.verified_by,
+          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+        });
+        const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+        if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+          return errorResponse(
+            "Cannot update status: Form record failed cryptographic integrity check. Possible database tampering detected.",
+            403
+          );
+        }
+
+        const nowIso = new Date().toISOString();
+        const nextMetaFormName = target.meta_form_name || target.name;
+        const nextVerifiedAt = target.verified_at || nowIso;
+        const nextVerifiedBy = admin.id;
+        const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
+        const payloadToSign = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: nextMetaFormName,
+          status: nextStatus,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verified_page_id: nextVerifiedPageId,
+        });
+        const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...target,
+          meta_form_name: nextMetaFormName,
+          status: nextStatus,
+          page_id: target.page_id || nextVerifiedPageId,
+          verified_page_id: nextVerifiedPageId,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verification_sig: newSig,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", targetSettingsId);
+
+        if (updateErr) return errorResponse("Failed to update form status: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form '${target.name}' status set to ${nextStatus}.`,
+          form: updatedRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 3. Rename Form Custom Display Label
+      if (body.action === "rename_meta_form") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        const newName = typeof body.new_name === "string" ? body.new_name.trim() : "";
+
+        if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
+        if (!newName) return errorResponse("New form name is required.", 400);
+
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
+          .from("agency_settings")
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
+          .maybeSingle();
+
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
+
+        const target = existingForms[targetIdx];
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (hmacSecret && target.verification_sig) {
+          const existingCanonical = canonicalizeFormPayload({
+            id: target.id,
+            meta_form_name: target.meta_form_name || target.name,
+            status: target.status,
+            verified_at: target.verified_at,
+            verified_by: target.verified_by,
+            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          });
+          const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+          if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+            return errorResponse(
+              "Cannot rename form: Form record failed cryptographic integrity check.",
+              403
+            );
+          }
+        }
+
+        const nowIso = new Date().toISOString();
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...target,
+          name: newName,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", targetSettingsId);
+
+        if (updateErr) return errorResponse("Failed to rename form: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form renamed to '${newName}'.`,
+          form: updatedRecord,
+          forms: updatedList,
+        });
+      }
+
+      // 4. Remove Form (Archives to inactive with HMAC sealing to preserve attribution)
+      if (body.action === "remove_meta_form") {
+        const formId = typeof body.form_id === "string" ? body.form_id.trim() : "";
+        if (!formId || !FORM_ID_REGEX.test(formId)) return errorResponse("Valid Form ID is required.", 400);
+
+        const hmacSecret = Deno.env.get("META_FORM_REGISTRY_HMAC_SECRET")?.trim();
+        if (!hmacSecret) {
+          return errorResponse("Cryptographic signing key is not configured in Supabase Secrets.", 500);
+        }
+
+        let settingsRow: any = null;
+        let targetSettingsId = "default";
+        const { data: defaultRow, error: defaultErr } = await supabase
+          .from("agency_settings")
+          .select("id, meta_lead_forms")
+          .eq("id", "default")
+          .maybeSingle();
+
+        if (!defaultErr && defaultRow) {
+          settingsRow = defaultRow;
+          targetSettingsId = defaultRow.id;
+        } else {
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from("agency_settings")
+            .select("id, meta_lead_forms")
+            .order("id", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          if (fallbackErr) return errorResponse("Failed to read agency settings: " + fallbackErr.message, 500);
+          settingsRow = fallbackRow;
+          if (fallbackRow?.id) targetSettingsId = fallbackRow.id;
+        }
+
+        const existingForms: VerifiedMetaLeadForm[] = Array.isArray(settingsRow?.meta_lead_forms)
+          ? settingsRow.meta_lead_forms
+          : [];
+
+        const targetIdx = existingForms.findIndex((f) => String(f.id).trim() === formId);
+        if (targetIdx === -1) return errorResponse("Form ID not found in registry.", 404);
+
+        const target = existingForms[targetIdx];
+        if (target.verification_sig) {
+          const existingCanonical = canonicalizeFormPayload({
+            id: target.id,
+            meta_form_name: target.meta_form_name || target.name,
+            status: target.status,
+            verified_at: target.verified_at,
+            verified_by: target.verified_by,
+            verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          });
+          const expectedExistingSig = await computeFormRegistryHmac(existingCanonical, hmacSecret);
+          if (!secureCompare(target.verification_sig.trim(), expectedExistingSig)) {
+            return errorResponse(
+              "Cannot deactivate form: Form record failed cryptographic integrity check.",
+              403
+            );
+          }
+        }
+
+        const nowIso = new Date().toISOString();
+        const nextMetaFormName = target.meta_form_name || target.name;
+        const nextVerifiedAt = target.verified_at || nowIso;
+        const nextVerifiedBy = admin.id;
+        const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
+        const payloadToSign = canonicalizeFormPayload({
+          id: target.id,
+          meta_form_name: nextMetaFormName,
+          status: "inactive",
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verified_page_id: nextVerifiedPageId,
+        });
+        const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
+
+        const updatedRecord: VerifiedMetaLeadForm = {
+          ...target,
+          meta_form_name: nextMetaFormName,
+          status: "inactive",
+          page_id: target.page_id || nextVerifiedPageId,
+          verified_page_id: nextVerifiedPageId,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verification_sig: newSig,
+          updated_at: nowIso,
+        };
+
+        const updatedList = [...existingForms];
+        updatedList[targetIdx] = updatedRecord;
+
+        const { error: updateErr } = await supabase
+          .from("agency_settings")
+          .update({
+            meta_lead_forms: updatedList,
+            updated_at: nowIso,
+            updated_by: admin.id,
+          })
+          .eq("id", targetSettingsId);
+
+        if (updateErr) return errorResponse("Failed to deactivate form: " + updateErr.message, 500);
+
+        return json({
+          success: true,
+          message: `Form '${existingForms[targetIdx].name}' deactivated and removed from active list.`,
+          forms: updatedList,
+        });
+      }
+
+      // ==========================================
+      // Employee Account Actions (require user_id)
+      // ==========================================
       const userId = typeof body.user_id === "string" ? body.user_id.trim() : "";
 
       if (!userId || !UUID_REGEX.test(userId)) {
@@ -190,10 +784,79 @@ Deno.serve(async (req: Request) => {
       // Fetch the target profile to ensure account exists
       const { data: target, error: fetchErr } = await supabase
         .from("profiles")
-        .select("id, email, role, is_active")
+        .select("id, email, full_name, role, is_active")
         .eq("id", userId)
         .maybeSingle();
       if (fetchErr || !target) return errorResponse("Employee not found.", 404);
+
+      // Delete Employee Account (Permanent deletion, business records preserved)
+      if (body.action === "delete_employee" || req.method === "DELETE") {
+        // Prevent deleting your own account (lockout guard)
+        if (userId === admin.id) {
+          return errorResponse("You cannot delete your own account.", 400);
+        }
+
+        // Prevent deleting admin accounts through employee management
+        if (target.role === "admin") {
+          return errorResponse("Admin accounts cannot be deleted through this interface.", 400);
+        }
+
+        // Business Records Preservation & Foreign Key Integrity:
+        // 1. Unassign leads from this employee
+        await supabase
+          .from("leads")
+          .update({ assigned_to: null })
+          .eq("assigned_to", userId);
+
+        // 2. Reassign leads created by this employee to the deleting admin (preserves lead audit history)
+        await supabase
+          .from("leads")
+          .update({ created_by: admin.id })
+          .eq("created_by", userId);
+
+        // 3. Reassign soft-delete / unqualified tracking if applicable
+        await supabase
+          .from("leads")
+          .update({ deleted_by: admin.id })
+          .eq("deleted_by", userId);
+
+        await supabase
+          .from("leads")
+          .update({ unqualified_by: admin.id })
+          .eq("unqualified_by", userId);
+
+        // 4. Unassign clients and reassign client creation to admin
+        await supabase
+          .from("clients")
+          .update({ assigned_to: null })
+          .eq("assigned_to", userId);
+
+        await supabase
+          .from("clients")
+          .update({ created_by: admin.id })
+          .eq("created_by", userId);
+
+        // 5. Reassign call logs to admin
+        await supabase
+          .from("lead_call_logs")
+          .update({ salesperson_id: admin.id })
+          .eq("salesperson_id", userId);
+
+        // 6. Delete user from Supabase Auth (Auth API)
+        const { error: authDeleteErr } = await supabase.auth.admin.deleteUser(userId);
+        if (authDeleteErr) {
+          console.error("Auth admin deleteUser failed for user:", userId, authDeleteErr.message);
+          return errorResponse(`Could not delete user from authentication system: ${authDeleteErr.message}`, 500);
+        }
+
+        // 7. Ensure profile row is removed if cascade was not triggered
+        await supabase.from("profiles").delete().eq("id", userId);
+
+        return json({
+          success: true,
+          message: `Employee ${target.full_name || target.email} permanently deleted. All business records have been preserved.`,
+        });
+      }
 
       // Update role
       if (body.action === "set_role") {
@@ -205,9 +868,12 @@ Deno.serve(async (req: Request) => {
         return json({ success: true });
       }
 
-      // Toggle active
-      if (body.action === "toggle_active") {
-        const nextActive = !!body.is_active;
+      // Toggle active status (accepts both "toggle_active" and "set_active" action aliases)
+      if (body.action === "toggle_active" || body.action === "set_active") {
+        if (typeof body.is_active !== "boolean" && body.is_active !== "true" && body.is_active !== "false") {
+          return errorResponse("is_active must be provided as a boolean (true or false).", 400);
+        }
+        const nextActive = body.is_active === true || body.is_active === "true";
 
         // Prevent deactivating your own account (lockout guard)
         if (!nextActive && userId === admin.id) {
@@ -224,9 +890,46 @@ Deno.serve(async (req: Request) => {
           if ((count ?? 0) <= 1) return errorResponse("Cannot deactivate the last active admin.", 400);
         }
 
-        const { error } = await supabase.from("profiles").update({ is_active: nextActive }).eq("id", userId);
-        if (error) return errorResponse("Could not update the account status.", 500);
-        return json({ success: true });
+        // Update Supabase Auth user ban duration:
+        // '876000h' (~100 years) bans the user from signing in.
+        // 'none' unbans the user, restoring sign-in capability.
+        const { error: authBanError } = await supabase.auth.admin.updateUserById(userId, {
+          ban_duration: nextActive ? "none" : "876000h",
+        });
+
+        if (authBanError) {
+          console.error("Auth admin updateUserById ban toggle failed:", userId, authBanError.message);
+          return errorResponse(`Could not update authentication ban status: ${authBanError.message}`, 500);
+        }
+
+        const { error: profileError } = await supabase
+          .from("profiles")
+          .update({ is_active: nextActive })
+          .eq("id", userId);
+
+        if (profileError) {
+          console.error("Profile update failed during toggle_active:", userId, profileError.message);
+          // Rollback of auth ban to keep state synchronized
+          const { error: rollbackErr } = await supabase.auth.admin.updateUserById(userId, {
+            ban_duration: nextActive ? "876000h" : "none",
+          });
+          if (rollbackErr) {
+            console.error("Auth ban rollback also failed:", userId, rollbackErr.message);
+            return errorResponse(
+              `Failed to update profile (${profileError.message}) and failed to rollback auth status (${rollbackErr.message}).`,
+              500
+            );
+          }
+          return errorResponse(`Could not update the account profile status: ${profileError.message}`, 500);
+        }
+
+        return json({
+          success: true,
+          is_active: nextActive,
+          message: nextActive
+            ? `Account for ${target.full_name || target.email} activated successfully.`
+            : `Account for ${target.full_name || target.email} deactivated successfully. Login access has been suspended.`,
+        });
       }
 
       // Update credentials (email and/or password)
