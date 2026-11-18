@@ -4742,6 +4742,7 @@ function SettingsPage({
     setFormFeedback(null);
     try {
       const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
         body: {
           action: 'verify_and_register_meta_form',
           form_url: instantFormLink.trim(),
@@ -4787,6 +4788,7 @@ function SettingsPage({
       // If form is unverified or missing cryptographic signature, route to verify_and_register_meta_form
       if (!formItem.verification_sig) {
         const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+          method: 'PATCH',
           body: {
             action: 'verify_and_register_meta_form',
             form_id: formItem.id,
@@ -4816,6 +4818,7 @@ function SettingsPage({
 
       const nextStatus = formItem.status === 'active' ? 'inactive' : 'active';
       const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
         body: {
           action: 'set_meta_form_status',
           form_id: formItem.id,
@@ -4853,6 +4856,7 @@ function SettingsPage({
     setFormFeedback(null);
     try {
       const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
         body: {
           action: 'rename_meta_form',
           form_id: formId,
@@ -4894,6 +4898,7 @@ function SettingsPage({
     setFormFeedback(null);
     try {
       const { data, error: fnError } = await supabase.functions.invoke('team-admin', {
+        method: 'PATCH',
         body: {
           action: 'remove_meta_form',
           form_id: formItem.id,

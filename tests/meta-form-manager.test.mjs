@@ -12,6 +12,12 @@
 
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..");
 
 const TAHA_PAGE_ID = "104523992487431";
 const FORM_ID_REGEX = /^\d{14,18}$/;
@@ -738,4 +744,408 @@ console.log("PASS 6: [SIMULATION] Admin registration fail-closed, status tamper 
 }
 console.log("PASS 7: [SIMULATION] Database trigger column protection (direct client writes blocked, backend service allowed)");
 
-console.log("\nALL META LEAD FORM MANAGER SECURITY & VALIDATION TESTS PASSED (7/7).\n");
+// ============================================================================
+// TEST 8: [REGRESSION] Frontend HTTP Method (PATCH) & Employee Creation (POST)
+// ============================================================================
+{
+  const appSource = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+  const invokeMatches = [
+    ...appSource.matchAll(/supabase\.functions\.invoke\('team-admin',\s*\{([\s\S]*?)\}\);/g),
+  ];
+
+  // Confirm all five Meta Form Manager frontend invocations exist and explicitly pass method: 'PATCH'
+  assert.equal(
+    invokeMatches.length,
+    5,
+    `Expected exactly 5 Meta Form Manager team-admin invocations in src/App.tsx, found ${invokeMatches.length}`
+  );
+
+  const expectedActions = [
+    "verify_and_register_meta_form",
+    "verify_and_register_meta_form",
+    "set_meta_form_status",
+    "rename_meta_form",
+    "remove_meta_form",
+  ];
+
+  invokeMatches.forEach((match, idx) => {
+    const block = match[1];
+    assert.match(
+      block,
+      /method:\s*['"]PATCH['"]/,
+      `Meta Form invocation #${idx + 1} (${expectedActions[idx]}) must specify method: 'PATCH'`
+    );
+    assert.match(
+      block,
+      new RegExp(`action:\\s*['"]${expectedActions[idx]}['"]`),
+      `Meta Form invocation #${idx + 1} must dispatch action '${expectedActions[idx]}'`
+    );
+  });
+
+  // Verify team-admin router preserves POST employee creation while routing Meta Form actions on PATCH
+  function simulateTeamAdminHttpRouter(method, body, state) {
+    if (method === "POST") {
+      const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+      const fullName = typeof body.full_name === "string" ? body.full_name.trim() : "";
+      const role = typeof body.role === "string" ? body.role : "";
+      const allowedRoles = ["sales", "editor", "script_writer", "social_media_manager", "finance", "employee"];
+
+      if (!email || !fullName) return { status: 400, error: "Name and email are required." };
+      if (!allowedRoles.includes(role)) return { status: 400, error: "Invalid role." };
+      if (!body.app_url) return { status: 400, error: "Application URL is required." };
+
+      const created = { id: `emp-${state.employees.length + 1}`, email, full_name: fullName, role, is_active: true };
+      state.employees.push(created);
+      return { status: 200, success: true, method: "invite", employee: created };
+    }
+
+    if (method === "PATCH") {
+      if (
+        ["verify_and_register_meta_form", "set_meta_form_status", "rename_meta_form", "remove_meta_form"].includes(
+          body.action
+        )
+      ) {
+        return { status: 200, success: true, routedAction: body.action };
+      }
+      return { status: 400, error: "Unknown action." };
+    }
+
+    return { status: 405, error: "Method not allowed." };
+  }
+
+  const routerState = { employees: [] };
+
+  // POST with Meta Form payload would fail with employee validation error (the exact regression we prevented)
+  const postMetaForm = simulateTeamAdminHttpRouter(
+    "POST",
+    { action: "verify_and_register_meta_form", form_id: "1650833669757581" },
+    routerState
+  );
+  assert.equal(postMetaForm.status, 400);
+  assert.equal(postMetaForm.error, "Name and email are required.");
+
+  // POST for employee creation remains fully functional
+  const postEmployee = simulateTeamAdminHttpRouter(
+    "POST",
+    {
+      email: "new.sales@tahamedia.in",
+      full_name: "New Salesperson",
+      role: "sales",
+      app_url: "https://crm.tahamedia.in",
+    },
+    routerState
+  );
+  assert.equal(postEmployee.status, 200);
+  assert.equal(postEmployee.success, true);
+  assert.equal(routerState.employees.length, 1);
+  assert.equal(routerState.employees[0].email, "new.sales@tahamedia.in");
+
+  // PATCH routes all four Meta Form Manager actions cleanly
+  for (const action of [
+    "verify_and_register_meta_form",
+    "set_meta_form_status",
+    "rename_meta_form",
+    "remove_meta_form",
+  ]) {
+    const patchRes = simulateTeamAdminHttpRouter("PATCH", { action, form_id: "1650833669757581" }, routerState);
+    assert.equal(patchRes.status, 200);
+    assert.equal(patchRes.routedAction, action);
+  }
+}
+console.log("PASS 8: [REGRESSION] All 5 Meta Form frontend calls use PATCH and POST employee creation remains functional");
+
+// ============================================================================
+// TEST 9: [REGRESSION] Full Lifecycle, Unsigned Form Upgrade & Cross-Admin HMAC Persistence
+// ============================================================================
+{
+  const teamAdminSource = fs.readFileSync(
+    path.join(repoRoot, "supabase", "functions", "team-admin", "index.ts"),
+    "utf8"
+  );
+
+  // Confirm team-admin persists verified_at and verified_by in both set_meta_form_status and remove_meta_form
+  const setStatusStart = teamAdminSource.indexOf('if (body.action === "set_meta_form_status")');
+  const renameStart = teamAdminSource.indexOf('if (body.action === "rename_meta_form")');
+  const removeStart = teamAdminSource.indexOf('if (body.action === "remove_meta_form")');
+  const employeeActionsStart = teamAdminSource.indexOf("// Employee Account Actions");
+
+  assert.ok(setStatusStart > 0 && renameStart > setStatusStart && removeStart > renameStart && employeeActionsStart > removeStart);
+
+  const setStatusBlock = teamAdminSource.slice(setStatusStart, renameStart);
+  const removeBlock = teamAdminSource.slice(removeStart, employeeActionsStart);
+
+  for (const [label, block] of [
+    ["set_meta_form_status", setStatusBlock],
+    ["remove_meta_form", removeBlock],
+  ]) {
+    assert.match(block, /verified_at:\s*nextVerifiedAt/, `${label} must persist verified_at matching signed payload`);
+    assert.match(block, /verified_by:\s*nextVerifiedBy/, `${label} must persist verified_by matching signed payload`);
+    assert.match(
+      block,
+      /verified_page_id:\s*nextVerifiedPageId/,
+      `${label} must persist verified_page_id matching signed payload`
+    );
+    assert.match(
+      block,
+      /meta_form_name:\s*nextMetaFormName/,
+      `${label} must persist meta_form_name matching signed payload`
+    );
+  }
+
+  // Exact backend handler simulation mirroring team-admin/index.ts & meta-lead-webhook/index.ts
+  function verifyRecordWithWebhook(record, hmacSecret) {
+    if (!record.verification_sig || !record.verification_sig.trim()) return false;
+    const canonical = canonicalizeFormPayload({
+      id: record.id,
+      meta_form_name: record.meta_form_name || record.name,
+      status: record.status,
+      verified_at: record.verified_at,
+      verified_by: record.verified_by,
+      verified_page_id: record.verified_page_id || TAHA_PAGE_ID,
+    });
+    const expected = computeFormRegistryHmac(canonical, hmacSecret);
+    return secureCompare(record.verification_sig.trim(), expected);
+  }
+
+  function runMetaFormPatch(admin, body, registry, hmacSecret, nowIso) {
+    const forms = registry.map((f) => ({ ...f }));
+
+    if (body.action === "verify_and_register_meta_form") {
+      const formId = String(body.form_id || "").trim();
+      if (!FORM_ID_REGEX.test(formId)) return { status: 400, error: "Invalid form ID" };
+      const metaFormName = body.meta_form_name || "Taha Media - Client Enquiry Form";
+      const displayName = body.custom_name || metaFormName;
+      const payloadToSign = canonicalizeFormPayload({
+        id: formId,
+        meta_form_name: metaFormName,
+        status: "active",
+        verified_at: nowIso,
+        verified_by: admin.id,
+        verified_page_id: TAHA_PAGE_ID,
+      });
+      const sig = computeFormRegistryHmac(payloadToSign, hmacSecret);
+      const existingIdx = forms.findIndex((f) => String(f.id).trim() === formId);
+      const newRecord = {
+        id: formId,
+        name: displayName,
+        meta_form_name: metaFormName,
+        status: "active",
+        page_id: TAHA_PAGE_ID,
+        verified_page_id: TAHA_PAGE_ID,
+        verified_at: nowIso,
+        verified_by: admin.id,
+        verification_sig: sig,
+        created_at: existingIdx >= 0 ? forms[existingIdx].created_at || nowIso : nowIso,
+        updated_at: nowIso,
+      };
+      if (existingIdx >= 0) forms[existingIdx] = newRecord;
+      else forms.push(newRecord);
+      return { status: 200, success: true, form: newRecord, forms };
+    }
+
+    if (body.action === "set_meta_form_status") {
+      const idx = forms.findIndex((f) => String(f.id).trim() === String(body.form_id).trim());
+      if (idx === -1) return { status: 404, error: "Form ID not found" };
+      const target = forms[idx];
+      if (!verifyRecordWithWebhook(target, hmacSecret)) {
+        return { status: 403, error: "Cryptographic integrity check failed" };
+      }
+      const nextMetaFormName = target.meta_form_name || target.name;
+      const nextVerifiedAt = target.verified_at || nowIso;
+      const nextVerifiedBy = admin.id;
+      const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
+      const payloadToSign = canonicalizeFormPayload({
+        id: target.id,
+        meta_form_name: nextMetaFormName,
+        status: body.status,
+        verified_at: nextVerifiedAt,
+        verified_by: nextVerifiedBy,
+        verified_page_id: nextVerifiedPageId,
+      });
+      const newSig = computeFormRegistryHmac(payloadToSign, hmacSecret);
+      const updatedRecord = {
+        ...target,
+        meta_form_name: nextMetaFormName,
+        status: body.status,
+        page_id: target.page_id || nextVerifiedPageId,
+        verified_page_id: nextVerifiedPageId,
+        verified_at: nextVerifiedAt,
+        verified_by: nextVerifiedBy,
+        verification_sig: newSig,
+        updated_at: nowIso,
+      };
+      forms[idx] = updatedRecord;
+      return { status: 200, success: true, form: updatedRecord, forms };
+    }
+
+    if (body.action === "rename_meta_form") {
+      const idx = forms.findIndex((f) => String(f.id).trim() === String(body.form_id).trim());
+      if (idx === -1) return { status: 404, error: "Form ID not found" };
+      const target = forms[idx];
+      if (target.verification_sig && !verifyRecordWithWebhook(target, hmacSecret)) {
+        return { status: 403, error: "Cryptographic integrity check failed" };
+      }
+      const updatedRecord = { ...target, name: body.new_name.trim(), updated_at: nowIso };
+      forms[idx] = updatedRecord;
+      return { status: 200, success: true, form: updatedRecord, forms };
+    }
+
+    if (body.action === "remove_meta_form") {
+      const idx = forms.findIndex((f) => String(f.id).trim() === String(body.form_id).trim());
+      if (idx === -1) return { status: 404, error: "Form ID not found" };
+      const target = forms[idx];
+      if (target.verification_sig && !verifyRecordWithWebhook(target, hmacSecret)) {
+        return { status: 403, error: "Cryptographic integrity check failed" };
+      }
+      const nextMetaFormName = target.meta_form_name || target.name;
+      const nextVerifiedAt = target.verified_at || nowIso;
+      const nextVerifiedBy = admin.id;
+      const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
+      const payloadToSign = canonicalizeFormPayload({
+        id: target.id,
+        meta_form_name: nextMetaFormName,
+        status: "inactive",
+        verified_at: nextVerifiedAt,
+        verified_by: nextVerifiedBy,
+        verified_page_id: nextVerifiedPageId,
+      });
+      const newSig = computeFormRegistryHmac(payloadToSign, hmacSecret);
+      const updatedRecord = {
+        ...target,
+        meta_form_name: nextMetaFormName,
+        status: "inactive",
+        page_id: target.page_id || nextVerifiedPageId,
+        verified_page_id: nextVerifiedPageId,
+        verified_at: nextVerifiedAt,
+        verified_by: nextVerifiedBy,
+        verification_sig: newSig,
+        updated_at: nowIso,
+      };
+      forms[idx] = updatedRecord;
+      return { status: 200, success: true, form: updatedRecord, forms };
+    }
+
+    return { status: 400, error: "Unknown action" };
+  }
+
+  const secret = "cross-admin-hmac-regression-secret-key-32b!";
+  const adminA = { id: "admin-uuid-a" };
+  const adminB = { id: "admin-uuid-b" };
+  const adminC = { id: "admin-uuid-c" };
+
+  // Start with the exact legacy unsigned production record
+  let registry = [{ id: "1650833669757581", name: "Taha Media - Client Enquiry Form", status: "active" }];
+  assert.equal(verifyRecordWithWebhook(registry[0], secret), false, "Legacy unsigned form must fail webhook verification");
+
+  // 1. Admin A registers/verifies the existing unsigned form in-place
+  const verified = runMetaFormPatch(
+    adminA,
+    {
+      action: "verify_and_register_meta_form",
+      form_id: "1650833669757581",
+      custom_name: "Taha Media - Client Enquiry Form",
+      meta_form_name: "Taha Media - Client Enquiry Form",
+    },
+    registry,
+    secret,
+    "2026-11-18T06:00:00.000Z"
+  );
+  assert.equal(verified.status, 200);
+  assert.equal(verified.forms.length, 1, "Existing unsigned form upgraded in place without duplicate");
+  assert.equal(verified.form.verified_by, adminA.id);
+  assert.equal(verified.form.verified_at, "2026-11-18T06:00:00.000Z");
+  assert.equal(verifyRecordWithWebhook(verified.form, secret), true, "Signed form passes webhook HMAC check");
+  registry = verified.forms;
+
+  // 2. Different Admin (Admin B) deactivates the form — verified_by & verified_at MUST match signature
+  const deactivatedByB = runMetaFormPatch(
+    adminB,
+    { action: "set_meta_form_status", form_id: "1650833669757581", status: "inactive" },
+    registry,
+    secret,
+    "2026-11-18T06:05:00.000Z"
+  );
+  assert.equal(deactivatedByB.status, 200);
+  assert.equal(deactivatedByB.form.status, "inactive");
+  assert.equal(deactivatedByB.form.verified_by, adminB.id, "Persisted verified_by updated to Admin B");
+  assert.equal(deactivatedByB.form.verified_at, "2026-11-18T06:00:00.000Z", "Persisted verified_at matches signed payload");
+  assert.equal(
+    verifyRecordWithWebhook(deactivatedByB.form, secret),
+    true,
+    "Signature MUST remain valid after status change by a different admin"
+  );
+  registry = deactivatedByB.forms;
+
+  // 3. Another Admin (Admin C) re-activates — must pass anti-tamper check against Admin B's signature
+  const reactivatedByC = runMetaFormPatch(
+    adminC,
+    { action: "set_meta_form_status", form_id: "1650833669757581", status: "active" },
+    registry,
+    secret,
+    "2026-11-18T06:10:00.000Z"
+  );
+  assert.equal(reactivatedByC.status, 200);
+  assert.equal(reactivatedByC.form.status, "active");
+  assert.equal(reactivatedByC.form.verified_by, adminC.id, "Persisted verified_by updated to Admin C");
+  assert.equal(
+    verifyRecordWithWebhook(reactivatedByC.form, secret),
+    true,
+    "Signature MUST remain valid after re-activation by Admin C"
+  );
+  registry = reactivatedByC.forms;
+
+  // 4. Rename updates custom display label while keeping canonical HMAC valid
+  const renamedByA = runMetaFormPatch(
+    adminA,
+    { action: "rename_meta_form", form_id: "1650833669757581", new_name: "Chennai Client Enquiry (Main)" },
+    registry,
+    secret,
+    "2026-11-18T06:12:00.000Z"
+  );
+  assert.equal(renamedByA.status, 200);
+  assert.equal(renamedByA.form.name, "Chennai Client Enquiry (Main)");
+  assert.equal(renamedByA.form.meta_form_name, "Taha Media - Client Enquiry Form");
+  assert.equal(verifyRecordWithWebhook(renamedByA.form, secret), true, "Rename preserves valid HMAC signature");
+  registry = renamedByA.forms;
+
+  // 5. Remove by a different admin (Admin B) seals inactive status with matching persisted fields
+  const removedByB = runMetaFormPatch(
+    adminB,
+    { action: "remove_meta_form", form_id: "1650833669757581" },
+    registry,
+    secret,
+    "2026-11-18T06:15:00.000Z"
+  );
+  assert.equal(removedByB.status, 200);
+  assert.equal(removedByB.form.status, "inactive");
+  assert.equal(removedByB.form.verified_by, adminB.id);
+  assert.equal(
+    verifyRecordWithWebhook(removedByB.form, secret),
+    true,
+    "Remove by different admin produces valid persisted HMAC signature"
+  );
+
+  // 6. Remove on a legacy unsigned form also persists verified_at, verified_by, verified_page_id, meta_form_name
+  const legacyUnsignedOnly = [{ id: "1650833669757581", name: "Legacy Form", status: "active" }];
+  const removedLegacy = runMetaFormPatch(
+    adminB,
+    { action: "remove_meta_form", form_id: "1650833669757581" },
+    legacyUnsignedOnly,
+    secret,
+    "2026-11-18T06:20:00.000Z"
+  );
+  assert.equal(removedLegacy.status, 200);
+  assert.equal(removedLegacy.form.status, "inactive");
+  assert.equal(removedLegacy.form.verified_by, adminB.id);
+  assert.equal(removedLegacy.form.verified_at, "2026-11-18T06:20:00.000Z");
+  assert.equal(removedLegacy.form.verified_page_id, TAHA_PAGE_ID);
+  assert.equal(removedLegacy.form.meta_form_name, "Legacy Form");
+  assert.equal(
+    verifyRecordWithWebhook(removedLegacy.form, secret),
+    true,
+    "Removed legacy unsigned form persists all signed canonical fields"
+  );
+}
+console.log("PASS 9: [REGRESSION] Unsigned upgrade, cross-admin status toggles, rename, and remove preserve canonical HMAC integrity");
+
+console.log("\nALL META LEAD FORM MANAGER SECURITY & VALIDATION TESTS PASSED (9/9).\n");

@@ -530,19 +530,28 @@ Deno.serve(async (req: Request) => {
         }
 
         const nowIso = new Date().toISOString();
+        const nextMetaFormName = target.meta_form_name || target.name;
+        const nextVerifiedAt = target.verified_at || nowIso;
+        const nextVerifiedBy = admin.id;
+        const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
         const payloadToSign = canonicalizeFormPayload({
           id: target.id,
-          meta_form_name: target.meta_form_name || target.name,
+          meta_form_name: nextMetaFormName,
           status: nextStatus,
-          verified_at: target.verified_at || nowIso,
-          verified_by: admin.id,
-          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verified_page_id: nextVerifiedPageId,
         });
         const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
 
         const updatedRecord: VerifiedMetaLeadForm = {
           ...target,
+          meta_form_name: nextMetaFormName,
           status: nextStatus,
+          page_id: target.page_id || nextVerifiedPageId,
+          verified_page_id: nextVerifiedPageId,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
           verification_sig: newSig,
           updated_at: nowIso,
         };
@@ -716,19 +725,28 @@ Deno.serve(async (req: Request) => {
         }
 
         const nowIso = new Date().toISOString();
+        const nextMetaFormName = target.meta_form_name || target.name;
+        const nextVerifiedAt = target.verified_at || nowIso;
+        const nextVerifiedBy = admin.id;
+        const nextVerifiedPageId = target.verified_page_id || TAHA_PAGE_ID;
         const payloadToSign = canonicalizeFormPayload({
           id: target.id,
-          meta_form_name: target.meta_form_name || target.name,
+          meta_form_name: nextMetaFormName,
           status: "inactive",
-          verified_at: target.verified_at || nowIso,
-          verified_by: admin.id,
-          verified_page_id: target.verified_page_id || TAHA_PAGE_ID,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
+          verified_page_id: nextVerifiedPageId,
         });
         const newSig = await computeFormRegistryHmac(payloadToSign, hmacSecret);
 
         const updatedRecord: VerifiedMetaLeadForm = {
           ...target,
+          meta_form_name: nextMetaFormName,
           status: "inactive",
+          page_id: target.page_id || nextVerifiedPageId,
+          verified_page_id: nextVerifiedPageId,
+          verified_at: nextVerifiedAt,
+          verified_by: nextVerifiedBy,
           verification_sig: newSig,
           updated_at: nowIso,
         };
