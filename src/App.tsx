@@ -2146,6 +2146,7 @@ function LeadDetail({
   onDelete,
 }: {
   lead: Lead;
+  hasLinkedClient?: boolean;
   profiles: Profile[];
   profile: Profile;
   callLogs?: LeadCallLog[];
