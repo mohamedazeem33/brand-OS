@@ -109,6 +109,11 @@ function normalizeLeadName(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\\s+/g, " ");
 }
 
+function normalizeLeadPhone(value: string): string {
+  const digits = value.replace(/\\D/g, "");
+  return digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
+}
+
 function extractFromFieldData(fieldData?: MetaFieldData[]) {
   if (!Array.isArray(fieldData)) return { name: "", phone: "", email: "", service: "", unmapped: [] };
 
@@ -436,7 +441,6 @@ Deno.serve(async (req: Request) => {
       const { data: phoneCandidates, error: candidateLookupError } = await supabase
         .from("leads")
         .select("id, name, phone, email, service, notes, meta_lead_id, deleted_at")
-        .eq("phone", phone)
         .is("meta_lead_id", null)
         .is("deleted_at", null);
 
@@ -446,7 +450,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const matchingManualLeads = (phoneCandidates || []).filter((candidate: any) =>
-        normalizeLeadName(candidate.name) === normalizeLeadName(name)
+        normalizeLeadName(candidate.name) === normalizeLeadName(name) && normalizeLeadPhone(candidate.phone) === normalizeLeadPhone(phone)
       );
 
       if (matchingManualLeads.length === 1) {
