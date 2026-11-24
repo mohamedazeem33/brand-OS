@@ -106,11 +106,11 @@ interface MetaFieldData {
 }
 
 function normalizeLeadName(value: string): string {
-  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\\s+/g, " ");
+  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
 }
 
 function normalizeLeadPhone(value: string): string {
-  const digits = value.replace(/\\D/g, "");
+  const digits = value.replace(/\D/g, "");
   return digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits;
 }
 
