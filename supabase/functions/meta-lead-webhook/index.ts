@@ -105,6 +105,10 @@ interface MetaFieldData {
   values?: string[];
 }
 
+function normalizeLeadName(value: string): string {
+  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\\s+/g, " ");
+}
+
 function extractFromFieldData(fieldData?: MetaFieldData[]) {
   if (!Array.isArray(fieldData)) return { name: "", phone: "", email: "", service: "", unmapped: [] };
 
@@ -422,6 +426,85 @@ Deno.serve(async (req: Request) => {
       notesParts.push(...metaContext);
     }
     const compiledNotes = notesParts.join("\n");
+
+    // 7. Conservative enrichment for a manually entered lead.
+    // Only consider an exact phone match, an exact normalized full-name match,
+    // and exactly one active manual candidate. Never merge on phone alone.
+    // Only enrich when Meta supplies a stable lead ID so the unique index can
+    // protect subsequent retries.
+    if (metaLeadId) {
+      const { data: phoneCandidates, error: candidateLookupError } = await supabase
+        .from("leads")
+        .select("id, name, phone, email, service, notes, meta_lead_id, deleted_at")
+        .eq("phone", phone)
+        .is("meta_lead_id", null)
+        .is("deleted_at", null);
+
+      if (candidateLookupError) {
+        console.error("Error checking manual lead candidates:", candidateLookupError);
+        return errorResponse("Could not safely check for an existing manual lead. Please retry.", 500);
+      }
+
+      const matchingManualLeads = (phoneCandidates || []).filter((candidate: any) =>
+        normalizeLeadName(candidate.name) === normalizeLeadName(name)
+      );
+
+      if (matchingManualLeads.length === 1) {
+        const manualLead = matchingManualLeads[0];
+        const enrichedNotes = [manualLead.notes?.trim(), compiledNotes]
+          .filter((part: string | undefined) => Boolean(part))
+          .join("\\n\\n");
+
+        const updatePayload: Record<string, unknown> = {
+          meta_lead_id: metaLeadId,
+          source: "Meta Ads",
+          notes: enrichedNotes,
+        };
+        if (!manualLead.email && email) updatePayload.email = email;
+        if ((!manualLead.service || manualLead.service === "Not specified") && service !== "Not specified") {
+          updatePayload.service = service;
+        }
+
+        const { data: enrichedLead, error: enrichError } = await supabase
+          .from("leads")
+          .update(updatePayload)
+          .eq("id", manualLead.id)
+          .is("meta_lead_id", null)
+          .is("deleted_at", null)
+          .select()
+          .maybeSingle();
+
+        if (enrichError) {
+          if (enrichError.code === "23505") {
+            const { data: concurrentDuplicate } = await supabase
+              .from("leads")
+              .select("id, name, phone, email, source, service, status, assigned_to, meta_lead_id, created_at")
+              .eq("meta_lead_id", metaLeadId)
+              .maybeSingle();
+            return json({
+              success: true,
+              duplicate: true,
+              message: "This Meta lead was already processed by a concurrent request.",
+              lead: concurrentDuplicate,
+            }, 200);
+          }
+          console.error("Error enriching manual lead:", enrichError);
+          return errorResponse("Could not safely enrich the existing manual lead.", 500);
+        }
+
+        if (enrichedLead) {
+          return json({
+            success: true,
+            duplicate: false,
+            enriched: true,
+            message: "Matched one manual lead by exact phone and full name; Meta details were added without changing its sales workflow.",
+            lead: enrichedLead,
+          }, 200);
+        }
+      } else if (matchingManualLeads.length > 1) {
+        console.warn("[meta-lead-webhook] Multiple exact manual matches found; creating a separate Meta lead instead of merging.");
+      }
+    }
 
     // 5. Salesperson Round-Robin Assignment
     let assignedTo: string | null = null;
