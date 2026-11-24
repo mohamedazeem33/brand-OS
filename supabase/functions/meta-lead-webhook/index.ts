@@ -505,6 +505,28 @@ Deno.serve(async (req: Request) => {
             lead: enrichedLead,
           }, 200);
         }
+
+        // Another webhook may have linked this manual row after our lookup.
+        // Never fall through to insert a second lead when the conditional update
+        // affects zero rows; re-check the Meta ID and fail safely if unresolved.
+        const { data: linkedLead, error: linkedLookupError } = await supabase
+          .from("leads")
+          .select("id, name, phone, email, source, service, status, assigned_to, meta_lead_id, created_at")
+          .eq("meta_lead_id", metaLeadId)
+          .maybeSingle();
+        if (linkedLookupError) {
+          console.error("Error checking concurrent Meta lead link:", linkedLookupError);
+          return errorResponse("Could not confirm whether this Meta lead was already processed. Please retry.", 500);
+        }
+        if (linkedLead) {
+          return json({
+            success: true,
+            duplicate: true,
+            message: "This Meta lead was already linked by a concurrent request.",
+            lead: linkedLead,
+          }, 200);
+        }
+        return errorResponse("The matching manual lead changed during import. Please retry this Meta lead.", 409);
       } else if (matchingManualLeads.length > 1) {
         console.warn("[meta-lead-webhook] Multiple exact manual matches found; creating a separate Meta lead instead of merging.");
       }
