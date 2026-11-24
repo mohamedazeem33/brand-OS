@@ -157,6 +157,16 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard; adminOn
 
 function friendlyError() { return 'Something went wrong. Please try again.'; }
 
+function normalizeLeadName(value: string): string {
+  return value.normalize('NFKC').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function normalizeLeadPhone(value: string): string {
+  const digits = value.replace(/\D/g, '');
+  // Treat an Indian +91 prefix as equivalent to the same 10-digit local number.
+  return digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+}
+
 function statusLabel(status: Lead['status']) {
   if (status === 'follow_up') return 'Follow-up';
   if (status === 'unqualified') return 'Unqualified';
@@ -519,6 +529,35 @@ function Workspace({
   const saveLead = async (form: LeadForm, id?: string) => {
     const assignedTo = isAdmin ? form.assigned_to : profile.id;
     const payload = { ...form, email: form.email || null, service: form.service || 'Not specified', assigned_to: assignedTo };
+
+    // Before a manual insert, redirect an exact name + normalized-phone match to the existing active lead.
+    // This is deliberately conservative: phone-only matches can represent different people or enquiries.
+    if (!id) {
+      const normalizedName = normalizeLeadName(form.name);
+      const normalizedPhone = normalizeLeadPhone(form.phone);
+      if (normalizedPhone.length >= 10) {
+        // Re-query at submit time rather than trusting the possibly stale dashboard list.
+        const { data: currentLeads, error: duplicateCheckError } = await supabase
+          .from('leads')
+          .select('*')
+          .is('deleted_at', null)
+          .neq('status', 'unqualified');
+        if (duplicateCheckError) throw new Error(friendlyError());
+
+        const existingMatch = ((currentLeads ?? []) as Lead[]).find((candidate) =>
+          normalizeLeadName(candidate.name) === normalizedName &&
+          normalizeLeadPhone(candidate.phone) === normalizedPhone
+        );
+
+        if (existingMatch) {
+          setDataError('A lead with the same name and phone number already exists. We opened the existing record instead of creating a duplicate.');
+          setShowAdd(false);
+          setSelectedLead(existingMatch);
+          return;
+        }
+      }
+    }
+
     const result = id ? await supabase.from('leads').update(payload).eq('id', id).select().maybeSingle() : await supabase.from('leads').insert(payload).select().maybeSingle();
     if (result.error || !result.data) throw new Error(friendlyError());
     await loadData(); setSelectedLead(result.data as Lead); setShowAdd(false);
