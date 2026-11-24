@@ -158,11 +158,11 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard; adminOn
 function friendlyError() { return 'Something went wrong. Please try again.'; }
 
 function normalizeLeadName(value: string): string {
-  return value.normalize('NFKC').trim().toLowerCase().replace(/\\s+/g, ' ');
+  return value.normalize('NFKC').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function normalizeLeadPhone(value: string): string {
-  const digits = value.replace(/\\D/g, '');
+  const digits = value.replace(/\D/g, '');
   // Treat an Indian +91 prefix as equivalent to the same 10-digit local number.
   return digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
 }
