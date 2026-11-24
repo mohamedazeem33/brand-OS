@@ -535,18 +535,26 @@ function Workspace({
     if (!id) {
       const normalizedName = normalizeLeadName(form.name);
       const normalizedPhone = normalizeLeadPhone(form.phone);
-      const existingMatch = leads.find((candidate) =>
-        !candidate.deleted_at &&
-        candidate.status !== 'unqualified' &&
-        normalizeLeadName(candidate.name) === normalizedName &&
-        normalizeLeadPhone(candidate.phone) === normalizedPhone &&
-        normalizedPhone.length >= 10
-      );
+      if (normalizedPhone.length >= 10) {
+        // Re-query at submit time rather than trusting the possibly stale dashboard list.
+        const { data: currentLeads, error: duplicateCheckError } = await supabase
+          .from('leads')
+          .select('*')
+          .is('deleted_at', null)
+          .neq('status', 'unqualified');
+        if (duplicateCheckError) throw new Error(friendlyError());
 
-      if (existingMatch) {
-        setShowAdd(false);
-        setSelectedLead(existingMatch);
-        return;
+        const existingMatch = ((currentLeads ?? []) as Lead[]).find((candidate) =>
+          normalizeLeadName(candidate.name) === normalizedName &&
+          normalizeLeadPhone(candidate.phone) === normalizedPhone
+        );
+
+        if (existingMatch) {
+          setDataError('A lead with the same name and phone number already exists. We opened the existing record instead of creating a duplicate.');
+          setShowAdd(false);
+          setSelectedLead(existingMatch);
+          return;
+        }
       }
     }
 
