@@ -157,6 +157,16 @@ const navItems: { id: Page; label: string; icon: typeof LayoutDashboard; adminOn
 
 function friendlyError() { return 'Something went wrong. Please try again.'; }
 
+function normalizeLeadName(value: string): string {
+  return value.normalize('NFKC').trim().toLowerCase().replace(/\\s+/g, ' ');
+}
+
+function normalizeLeadPhone(value: string): string {
+  const digits = value.replace(/\\D/g, '');
+  // Treat an Indian +91 prefix as equivalent to the same 10-digit local number.
+  return digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+}
+
 function statusLabel(status: Lead['status']) {
   if (status === 'follow_up') return 'Follow-up';
   if (status === 'unqualified') return 'Unqualified';
@@ -519,6 +529,27 @@ function Workspace({
   const saveLead = async (form: LeadForm, id?: string) => {
     const assignedTo = isAdmin ? form.assigned_to : profile.id;
     const payload = { ...form, email: form.email || null, service: form.service || 'Not specified', assigned_to: assignedTo };
+
+    // Before a manual insert, redirect an exact name + normalized-phone match to the existing active lead.
+    // This is deliberately conservative: phone-only matches can represent different people or enquiries.
+    if (!id) {
+      const normalizedName = normalizeLeadName(form.name);
+      const normalizedPhone = normalizeLeadPhone(form.phone);
+      const existingMatch = leads.find((candidate) =>
+        !candidate.deleted_at &&
+        candidate.status !== 'unqualified' &&
+        normalizeLeadName(candidate.name) === normalizedName &&
+        normalizeLeadPhone(candidate.phone) === normalizedPhone &&
+        normalizedPhone.length >= 10
+      );
+
+      if (existingMatch) {
+        setShowAdd(false);
+        setSelectedLead(existingMatch);
+        return;
+      }
+    }
+
     const result = id ? await supabase.from('leads').update(payload).eq('id', id).select().maybeSingle() : await supabase.from('leads').insert(payload).select().maybeSingle();
     if (result.error || !result.data) throw new Error(friendlyError());
     await loadData(); setSelectedLead(result.data as Lead); setShowAdd(false);
